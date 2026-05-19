@@ -349,6 +349,22 @@ class MotionConstraintExecutor:
             pos = self.resolve_entity_positions(cache, args["entity"])
             return _to_numpy(pos[:, 1])
 
+        if name == "foot_height":
+            # PDF spec (page 5): pos(foot).y, optionally offset by the minimum
+            # observed foot height so the result is foot height above the
+            # ground. Defaults to the right foot, matching the PDF example.
+            foot = str(args.get("foot", "r_foot")).lower()
+            joint_key = "l_foot" if foot in {"left", "l_foot"} else "r_foot"
+            pos = self.resolve_entity_positions(cache, joint_key)
+            height = pos[:, 1]
+            if bool(args.get("relative_to_ground", True)):
+                ground = torch.minimum(
+                    cache.joints[:, JOINT_INDEX["l_foot"], 1].min(),
+                    cache.joints[:, JOINT_INDEX["r_foot"], 1].min(),
+                )
+                height = height - ground
+            return _to_numpy(height)
+
         if name == "relative_height":
             pos = self.resolve_entity_positions(cache, args["entity"])
             base = self.resolve_entity_positions(cache, args.get("base", "pelvis"))
@@ -362,13 +378,25 @@ class MotionConstraintExecutor:
             return _to_numpy(speed)
 
         if name == "directional_displacement":
+            # PDF spec (page 4):
+            #   root_vel = compute_world_vel(pelvis)
+            #   body_vel_dir = root_vel . body_axes[dir]
+            #   pos_dis = cumsum(positive(body_vel_dir) * fps)
+            #   reward = pos_dis[last] > displace_thresh    (binary at the caller)
+            # Default `multiply_fps=False` keeps the historical units (raw
+            # cumulative displacement in body-scale units). Set
+            # `multiply_fps=True` to follow the PDF formula literally so a
+            # threshold can be specified in (body lengths / second).
             entity = args.get("entity", "pelvis")
             direction = args.get("direction", "forward")
             frame = args.get("frame", "body")
+            multiply_fps = bool(args.get("multiply_fps", False))
             pos = self.resolve_entity_positions(cache, entity)
             axis = self._axis_vectors(cache, direction, frame)
             delta = pos[1:] - pos[:-1]
             projected = (delta * axis[:-1]).sum(dim=-1)
+            if multiply_fps:
+                projected = projected * float(cache.fps)
             positive = torch.clamp(projected, min=0.0)
             cumulative = torch.cat([
                 torch.zeros(1, device=pos.device, dtype=pos.dtype),
@@ -479,29 +507,27 @@ class MotionConstraintExecutor:
         raise ValueError(f"Unknown template: {name}")
 
     def _template_step(self, cache: MotionCache, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # PDF spec (page 6): l/r_move_state = (1 - foot_contact_263) > 0.5,
+        # count rest->move rising edges per foot. The legacy hybrid detector
+        # (contact + height + speed + landing) is still reachable via
+        # `args["detector"] = "hybrid"` for backwards compatibility.
         foot = str(args.get("foot", "any")).lower()
-        detector_options = {
-            key: args[key]
-            for key in (
-                "contact_threshold",
-                "max_contact_height",
-                "max_contact_speed",
-                "min_contact_frames",
-                "min_valid_ratio",
-                "max_contact_gap",
-                "min_step_separation",
-                "landing_height",
-                "swing_height",
-                "landing_min_travel",
-                "landing_lookback",
-                "landing_confidence",
+        detector_kind = str(args.get("detector", "move_state")).lower()
+        if detector_kind == "hybrid":
+            accepted = (
+                "contact_threshold", "max_contact_height", "max_contact_speed",
+                "min_contact_frames", "min_valid_ratio", "max_contact_gap",
+                "min_step_separation", "landing_height", "swing_height",
+                "landing_min_travel", "landing_lookback", "landing_confidence",
             )
-            if key in args
-        }
+        else:
+            accepted = ("contact_threshold", "min_step_separation", "min_move_frames")
+        detector_options = {k: args[k] for k in accepted if k in args}
         events = detect_step_events(
             cache.joints,
             cache.foot_contact,
             foot=foot,
+            detector=detector_kind,
             **detector_options,
         )
         segments: List[Dict[str, Any]] = []
@@ -516,7 +542,7 @@ class MotionConstraintExecutor:
                 "meta": {
                     "template": "step",
                     "foot": label,
-                    "detector": "hybrid_contact_height_speed_landing",
+                    "detector": detector_kind,
                     "source": event.source,
                     "valid_ratio": event.valid_ratio,
                     "min_height": event.min_height,
@@ -583,15 +609,53 @@ class MotionConstraintExecutor:
         return segments
 
     def _template_clap(self, cache: MotionCache, args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
-        threshold = float(args.get("threshold", 0.08))
+        # PDF spec (page 7): basin detection with hysteresis.
+        #   enter_threshold = threshold (default 0.077)
+        #   exit_threshold  = threshold * 1.6
+        # State machine on dist between hands: idle -> inside (dist <= enter)
+        # -> idle again only when dist > exit. Each completed (enter, exit)
+        # pair counts as one clap.
+        threshold = float(args.get("threshold", 0.077))
+        enter_threshold = float(args.get("enter_threshold", threshold))
+        exit_threshold = float(args.get("exit_threshold", threshold * 1.6))
+        min_frames = int(args.get("min_frames", 1))
         dist = self.signal(cache, "dist", {"a": "l_hand", "b": "r_hand"})
+
         segments: List[Dict[str, Any]] = []
-        for start, end in _bool_segments(dist < threshold, min_len=int(args.get("min_frames", 1))):
-            local = dist[start:end]
-            key = start + int(np.argmin(local)) if local.size else start
+        inside = False
+        run_start: Optional[int] = None
+        for idx, value in enumerate(dist):
+            if not inside and value <= enter_threshold:
+                inside = True
+                run_start = idx
+            elif inside and value > exit_threshold:
+                run_end = idx
+                if run_start is not None and run_end - run_start >= min_frames:
+                    local = dist[run_start:run_end]
+                    key = run_start + int(np.argmin(local)) if local.size else run_start
+                    segments.append({
+                        "start": run_start,
+                        "end": run_end,
+                        "key_frame": key,
+                        "score": 1.0,
+                        "label": "clap",
+                        "meta": {
+                            "template": "clap",
+                            "left_hand": "l_hand",
+                            "right_hand": "r_hand",
+                            "enter_threshold": enter_threshold,
+                            "exit_threshold": exit_threshold,
+                            "min_dist": float(np.min(local)) if local.size else 0.0,
+                        },
+                    })
+                inside = False
+                run_start = None
+        if inside and run_start is not None and len(dist) - run_start >= min_frames:
+            local = dist[run_start:]
+            key = run_start + int(np.argmin(local)) if local.size else run_start
             segments.append({
-                "start": start,
-                "end": end,
+                "start": run_start,
+                "end": len(dist),
                 "key_frame": key,
                 "score": 1.0,
                 "label": "clap",
@@ -599,10 +663,17 @@ class MotionConstraintExecutor:
                     "template": "clap",
                     "left_hand": "l_hand",
                     "right_hand": "r_hand",
+                    "enter_threshold": enter_threshold,
+                    "exit_threshold": exit_threshold,
                     "min_dist": float(np.min(local)) if local.size else 0.0,
+                    "open_basin": True,
                 },
             })
-        limitations = ["clap is contact/proximity based; approach and separation are not fully verified."]
+
+        limitations = [
+            "clap uses enter/exit hysteresis on inter-hand distance; "
+            "approach and separation kinematics are not explicitly verified."
+        ]
         return segments, limitations
 
     def _template_hands_close(self, cache: MotionCache, args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -659,9 +730,21 @@ class MotionConstraintExecutor:
         return sorted(segments, key=lambda item: item["start"]), []
 
     def _template_raise_foot(self, cache: MotionCache, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # PDF spec (page 5):
+        #   r_foot_height = pos(r_foot).y
+        #   value = max(r_foot_height)
+        #   reward = value > threshold     (threshold = 0.08, binary)
+        # That collapses to a single segment iff the max foot height exceeds
+        # the threshold. mode="binary_max" implements PDF exactly; the legacy
+        # mode="segments" (default for backward compatibility) instead emits
+        # one segment per sustained period above the threshold so callers can
+        # use count semantics (e.g. "raise the right foot twice"). To opt into
+        # the PDF formulation, also expose `signal:foot_height` with
+        # reduce="max".
         foot = str(args.get("foot", "any")).lower()
         threshold = float(args.get("threshold", 0.08))
         min_frames = int(args.get("min_frames", 2))
+        mode = str(args.get("mode", "segments")).lower()
         ground_y = torch.minimum(
             cache.joints[:, JOINT_INDEX["l_foot"], 1].min(),
             cache.joints[:, JOINT_INDEX["r_foot"], 1].min(),
@@ -675,6 +758,27 @@ class MotionConstraintExecutor:
         segments: List[Dict[str, Any]] = []
         for foot_name in candidates:
             height = _to_numpy(cache.joints[:, JOINT_INDEX[foot_name], 1] - ground_y)
+            if mode == "binary_max":
+                if height.size == 0:
+                    continue
+                max_h = float(np.max(height))
+                if max_h <= threshold:
+                    continue
+                key = int(np.argmax(height))
+                segments.append({
+                    "start": key,
+                    "end": key + 1,
+                    "key_frame": key,
+                    "score": float(max_h / max(threshold, 1e-8)),
+                    "label": f"raise_{foot_name}",
+                    "meta": {
+                        "template": "raise_foot",
+                        "foot": foot_name,
+                        "max_height": max_h,
+                        "mode": "binary_max",
+                    },
+                })
+                continue
             for start, end in _bool_segments(height > threshold, min_len=min_frames):
                 local = height[start:end]
                 key = start + int(np.argmax(local)) if local.size else start
@@ -688,25 +792,38 @@ class MotionConstraintExecutor:
                         "template": "raise_foot",
                         "foot": foot_name,
                         "max_height": float(np.max(local)) if local.size else 0.0,
+                        "mode": "segments",
                     },
                 })
         return sorted(segments, key=lambda item: item["start"])
 
     def _template_squat(self, cache: MotionCache, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # PDF spec (page 7-8):
+        #   values = pos(pelvis).y
+        #   local_min = local_find(values)
+        #   left_peak = walk_local_peak_left(local_min)
+        #   right_peak = walk_local_peak_right(local_min)
+        #   drop = min(left_peak, right_peak) - local_min
+        #   event = drop >= threshold     (threshold = 0.15)
+        # `walk_local_peak_{left,right}` walks outward from each local minimum
+        # until the height stops increasing -- i.e. it finds the nearest local
+        # maximum on each side rather than capping at a fixed window.
         pelvis_y = self.signal(cache, "height", {"entity": "pelvis"})
         threshold = float(args.get("threshold", 0.15))
-        window = int(args.get("peak_window", 8))
         segments: List[Dict[str, Any]] = []
-        if len(pelvis_y) < 3:
+        n = len(pelvis_y)
+        if n < 3:
             return segments
 
-        for idx in range(1, len(pelvis_y) - 1):
+        for idx in range(1, n - 1):
             if not (pelvis_y[idx] <= pelvis_y[idx - 1] and pelvis_y[idx] < pelvis_y[idx + 1]):
                 continue
-            left_start = max(0, idx - window)
-            right_end = min(len(pelvis_y), idx + window + 1)
-            left_peak_idx = left_start + int(np.argmax(pelvis_y[left_start:idx + 1]))
-            right_peak_idx = idx + int(np.argmax(pelvis_y[idx:right_end]))
+            left_peak_idx = idx
+            while left_peak_idx - 1 >= 0 and pelvis_y[left_peak_idx - 1] >= pelvis_y[left_peak_idx]:
+                left_peak_idx -= 1
+            right_peak_idx = idx
+            while right_peak_idx + 1 < n and pelvis_y[right_peak_idx + 1] >= pelvis_y[right_peak_idx]:
+                right_peak_idx += 1
             drop = min(pelvis_y[left_peak_idx], pelvis_y[right_peak_idx]) - pelvis_y[idx]
             if drop >= threshold:
                 segments.append({
@@ -715,13 +832,30 @@ class MotionConstraintExecutor:
                     "key_frame": int(idx),
                     "score": float(drop / max(threshold, 1e-8)),
                     "label": "squat_cycle",
-                    "meta": {"template": "squat_cycle", "drop": float(drop)},
+                    "meta": {
+                        "template": "squat_cycle",
+                        "drop": float(drop),
+                        "left_peak_frame": int(left_peak_idx),
+                        "right_peak_frame": int(right_peak_idx),
+                    },
                 })
         return segments
 
     def _template_turn(self, cache: MotionCache, args: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
+        # PDF spec (page 5):
+        #   yaw_vel = root_rot_vel_in_263_feat (motion_raw[:, 0]); 2x for half-angle convention
+        #   angle = sum(yaw_vel) in degrees
+        #   tl_state = (yaw_vel/threshold).clip(0, None) > threshold  (per-frame "actively turning")
+        #   angle_flag = angle in (min_angle, max_angle)
+        #   reward = time(tl_state) > time_threshold if angle_flag else 0
+        # Per-frame active mask is preserved as before; we additionally enforce
+        # the max_angle gate and an explicit time_threshold so segments that do
+        # not actually meet the PDF criteria are filtered out (yielding zero
+        # reward downstream).
         min_angle = float(args.get("min_angle_deg", 20.0))
+        max_angle = float(args.get("max_angle_deg", float("inf")))
         min_frames = int(args.get("min_frames", max(2, round(0.2 * cache.fps))))
+        time_threshold_frames = int(args.get("time_threshold_frames", min_frames))
         signed = cache.motion_raw[:, 0] * 2.0 * (180.0 / math.pi)
         if direction == "right":
             signed = -signed
@@ -729,8 +863,11 @@ class MotionConstraintExecutor:
 
         segments: List[Dict[str, Any]] = []
         for start, end in _bool_segments(active, min_len=min_frames):
+            duration_frames = end - start
+            if duration_frames < time_threshold_frames:
+                continue
             angle = float(torch.clamp(signed[start:end], min=0.0).sum().item())
-            if angle < min_angle:
+            if angle < min_angle or angle > max_angle:
                 continue
             segments.append({
                 "start": start,
@@ -741,7 +878,11 @@ class MotionConstraintExecutor:
                 "meta": {
                     "template": f"turn_{direction}",
                     "angle_deg": angle,
-                    "duration": (end - start) / cache.fps,
+                    "duration": duration_frames / cache.fps,
+                    "duration_frames": duration_frames,
+                    "min_angle_deg": min_angle,
+                    "max_angle_deg": max_angle if max_angle != float("inf") else None,
+                    "time_threshold_frames": time_threshold_frames,
                 },
             })
         return segments

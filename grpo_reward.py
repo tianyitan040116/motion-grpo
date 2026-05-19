@@ -260,43 +260,44 @@ def _count_steps_in_range(
     start: int = 0,
     end: int = -1,
     joints: Optional[torch.Tensor] = None,
+    *,
+    detector: str = "move_state",
+    **detector_kwargs,
 ) -> int:
     """Count steps within a frame range.
 
-    When joint positions are available, use the shared hybrid detector: contact
-    starts are checked against foot height and speed, with landing-event
-    fallback for missing contact labels.  The contact-only path is kept for old
-    callers that do not have joints yet.
+    Defaults to the New Reward PDF formulation: per foot,
+    `move_state = (1 - foot_contact_channels) > 0.5`, then count rest->move
+    rising edges. The legacy hybrid contact + height + speed + landing
+    detector (which requires `joints`) is still available via
+    `detector="hybrid"`.
 
     Args:
-        foot_contact: [T, 4] binary foot contact (left_heel, left_toe, right_heel, right_toe)
-        start: start frame (inclusive)
-        end: end frame (exclusive), -1 means T
-        joints: optional [T, 22, 3] world-space joint positions
+        foot_contact: [T, 4] foot contact channels in order
+            (left_heel, left_toe, right_heel, right_toe).
+        start: start frame (inclusive).
+        end: end frame (exclusive), -1 means T.
+        joints: optional [T, 22, 3] world-space joint positions. Required
+            when `detector="hybrid"`; ignored for the default move_state path.
+        detector: "move_state" (default) or "hybrid".
+        **detector_kwargs: forwarded to the underlying detector.
 
     Returns:
         Number of detected steps.
     """
     if end == -1:
         end = foot_contact.shape[0]
-    if joints is not None:
-        return detect_steps(joints, foot_contact, start=start, end=end).count
-
-    fc = foot_contact[start:end]
-    if fc.shape[0] < 2:
-        return 0
-
-    left = ((fc[:, 0] + fc[:, 1]) > 0.5).cpu().numpy()
-    right = ((fc[:, 2] + fc[:, 3]) > 0.5).cpu().numpy()
-
-    steps = 0
-    for foot in [left, right]:
-        prev = foot[0]
-        for t in range(1, len(foot)):
-            if not prev and foot[t]:
-                steps += 1
-            prev = foot[t]
-    return steps
+    if detector == "hybrid":
+        if joints is None:
+            raise ValueError("detector='hybrid' requires `joints`.")
+        return detect_steps(
+            joints, foot_contact, start=start, end=end, detector="hybrid",
+            **detector_kwargs,
+        ).count
+    return detect_steps(
+        joints, foot_contact, start=start, end=end, detector="move_state",
+        **detector_kwargs,
+    ).count
 
 
 # Keep old interface for backward compatibility
@@ -1110,13 +1111,20 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
 
     if 'clap' in text:
         target = _caption_number_hint(text, default=1.0)
+        # PDF spec (page 7): basin detection with hysteresis at threshold=0.077,
+        # exit_threshold = threshold * 1.6.
         specs.append({
             "id": "clap_count",
             "kind": "count",
             "ref": {
                 "type": "template",
                 "name": "clap",
-                "args": {"threshold": 0.09, "min_frames": 1},
+                "args": {
+                    "threshold": 0.077,
+                    "enter_threshold": 0.077,
+                    "exit_threshold": 0.077 * 1.6,
+                    "min_frames": 1,
+                },
             },
             "op": "eq",
             "value": target,
@@ -1126,13 +1134,14 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
 
     if 'squat' in text:
         target = _caption_number_hint(text, default=1.0)
+        # PDF spec (page 8): drop threshold 0.15.
         specs.append({
             "id": "squat_count",
             "kind": "count",
             "ref": {
                 "type": "template",
                 "name": "squat_cycle",
-                "args": {"threshold": 0.12},
+                "args": {"threshold": 0.15},
             },
             "op": "eq",
             "value": target,
@@ -1157,21 +1166,75 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
             foot = 'left'
         elif 'right' in text:
             foot = 'right'
+        # PDF spec (page 5): value = max(foot.y); reward = value > 0.08.
+        # `mode="binary_max"` emits at most one segment iff the peak foot
+        # height clears the threshold, matching the PDF formulation.
         _add_presence_rule(
             specs, 'raise_foot_present', 'raise_foot',
-            {"foot": foot, "threshold": 0.08, "min_frames": 2}, weight=0.8,
+            {"foot": foot, "threshold": 0.08, "mode": "binary_max"}, weight=0.8,
         )
 
     if 'turn left' in text:
+        # PDF spec (page 5): require the turn to actually span enough frames
+        # (`time_threshold_frames`) on top of the cumulative angle check.
         _add_presence_rule(
             specs, 'turn_left_present', 'turn_left',
-            {"min_angle_deg": 20.0}, weight=0.8,
+            {"min_angle_deg": 20.0, "time_threshold_frames": 4}, weight=0.8,
         )
     if 'turn right' in text:
         _add_presence_rule(
             specs, 'turn_right_present', 'turn_right',
-            {"min_angle_deg": 20.0}, weight=0.8,
+            {"min_angle_deg": 20.0, "time_threshold_frames": 4}, weight=0.8,
         )
+
+    # PDF spec (page 4) for "move forward / backward / left / right" emits
+    # a compound reward: cumulative positive displacement along the requested
+    # body axis must exceed a displacement threshold, AND the per-frame motion
+    # purity (pos_dis / (pos_dis + neg_dis)) must exceed a direction threshold.
+    # The two scalars combine additively at the executor level.
+    direction_terms = [
+        ('move forward', 'forward'),
+        ('move backward', 'backward'),
+        ('move to the left', 'left'),
+        ('move to the right', 'right'),
+        ('walk forward', 'forward'),
+        ('walk backward', 'backward'),
+        ('go forward', 'forward'),
+        ('go backward', 'backward'),
+    ]
+    for phrase, axis in direction_terms:
+        if phrase in text:
+            specs.append({
+                "id": f"{axis}_displacement",
+                "kind": "signal",
+                "ref": {
+                    "type": "signal",
+                    "name": "directional_displacement",
+                    "args": {
+                        "entity": "pelvis", "direction": axis, "frame": "body",
+                    },
+                },
+                "reduce": "last",
+                "op": "ge",
+                "value": 0.25,
+                "weight": 1.0,
+            })
+            specs.append({
+                "id": f"{axis}_direction_score",
+                "kind": "signal",
+                "ref": {
+                    "type": "signal",
+                    "name": "direction_score",
+                    "args": {
+                        "entity": "pelvis", "direction": axis, "frame": "body",
+                    },
+                },
+                "reduce": "last",
+                "op": "ge",
+                "value": 0.6,
+                "weight": 0.5,
+            })
+            break
 
     # Anti-exploit regularizers for narrow upper-body actions: if the prompt is
     # mostly hands/feet, discourage large root drift from satisfying the reward

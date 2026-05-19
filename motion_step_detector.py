@@ -1,9 +1,14 @@
-"""Shared hybrid step detector for reward and executor code.
+"""Step detector aligned with the New Reward specification.
 
-The generated motion contains foot-contact channels, but those channels can be
-noisy during RL.  This detector treats contact as a candidate event and checks
-it against foot height and foot speed.  If contact labels are missing, it can
-still recover a step from a clear landing event.
+The canonical algorithm (see New Reward PDF, page 6) is:
+
+    l_move_state = (1 - l_foot_contact_in_263_feat) > 0.5
+    r_move_state = (1 - r_foot_contact_in_263_feat) > 0.5
+    -> count "rest -> move" rising edges per foot
+
+The legacy hybrid contact + height + speed detector is kept as an opt-in
+fallback for callers that explicitly request it via `detector="hybrid"`,
+but is no longer the default.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ RIGHT_FOOT_JOINT = 11
 
 @dataclass
 class StepEvent:
-    """One validated footfall in absolute frame coordinates."""
+    """One detected step in absolute frame coordinates."""
 
     foot: str
     start: int
@@ -28,9 +33,11 @@ class StepEvent:
     key_frame: int
     source: str
     confidence: float
-    valid_ratio: float
-    min_height: float
-    mean_speed: float
+    # Hybrid-detector diagnostics; default to neutral values when the
+    # move-state path does not populate them.
+    valid_ratio: float = 1.0
+    min_height: float = 0.0
+    mean_speed: float = 0.0
 
 
 @dataclass
@@ -43,6 +50,17 @@ class StepDetectionResult:
     @property
     def count(self) -> int:
         return len(self.events)
+
+
+def _foot_names(foot: str) -> Iterable[str]:
+    foot = str(foot or "any").lower()
+    if foot in {"any", "both"}:
+        return ("left", "right")
+    if foot in {"left", "l_foot", "left_foot"}:
+        return ("left",)
+    if foot in {"right", "r_foot", "right_foot"}:
+        return ("right",)
+    return ()
 
 
 def _bool_runs(mask: torch.Tensor) -> List[Tuple[int, int]]:
@@ -60,10 +78,162 @@ def _bool_runs(mask: torch.Tensor) -> List[Tuple[int, int]]:
     return runs
 
 
+def detect_move_state_steps(
+    foot_contact: torch.Tensor,
+    start: int = 0,
+    end: int = -1,
+    foot: str = "any",
+    *,
+    contact_threshold: float = 0.5,
+    min_step_separation: int = 3,
+    min_move_frames: int = 1,
+) -> StepDetectionResult:
+    """Count steps using the New Reward PDF formula.
+
+    For each foot:
+        move_state = (1 - foot_contact_channels) > contact_threshold
+    A step is one rising edge (rest -> move). Adjacent edges within
+    `min_step_separation` frames are merged so a single transition is not
+    counted twice when the contact label flickers.
+    """
+    if end == -1:
+        end = int(foot_contact.shape[0])
+    start = max(0, int(start))
+    end = min(int(end), int(foot_contact.shape[0]))
+    if end - start < 2:
+        return StepDetectionResult([], 0.0, 0, 0)
+
+    fc = foot_contact[start:end].detach().float()
+
+    foot_defs: Dict[str, Tuple[int, int]] = {
+        "left": (0, 1),
+        "right": (2, 3),
+    }
+
+    events: List[StepEvent] = []
+    for foot_name in _foot_names(foot):
+        if foot_name not in foot_defs:
+            continue
+        i, j = foot_defs[foot_name]
+        per_foot_contact = (fc[:, i] + fc[:, j]) * 0.5
+        move_state = (1.0 - per_foot_contact) > float(contact_threshold)
+
+        runs = [
+            (rs, re) for rs, re in _bool_runs(move_state)
+            if re - rs >= int(min_move_frames)
+        ]
+        # Only count runs that begin with a verifiable rest->move transition.
+        # A run that starts at frame 0 lacks an observable preceding rest state
+        # so it is not a confirmed rising edge -- the PDF example explicitly
+        # assumes the motion starts in a rest (contact) state.
+        last_kept_frame: Optional[int] = None
+        for run_start, run_end in runs:
+            if run_start == 0:
+                continue
+            abs_frame = start + run_start
+            if last_kept_frame is not None and abs_frame - last_kept_frame < int(min_step_separation):
+                continue
+            last_kept_frame = abs_frame
+            events.append(StepEvent(
+                foot=foot_name,
+                start=abs_frame,
+                # A step is a near-instantaneous rest->move transition; we
+                # mark a 1-frame window so downstream temporal relations
+                # like "before" / "after" treat the step as a point event
+                # rather than a long run spanning the rest of the motion.
+                end=abs_frame + 1,
+                key_frame=abs_frame,
+                source="move_state",
+                confidence=1.0,
+            ))
+
+    events.sort(key=lambda ev: (ev.key_frame, ev.foot))
+    return StepDetectionResult(
+        events=events,
+        consistency_penalty=0.0,
+        contact_events=len(events),
+        landing_events=0,
+    )
+
+
+def detect_steps(
+    joints: torch.Tensor,
+    foot_contact: torch.Tensor,
+    start: int = 0,
+    end: int = -1,
+    foot: str = "any",
+    *,
+    detector: str = "move_state",
+    **kwargs,
+) -> StepDetectionResult:
+    """Top-level step detector.
+
+    Defaults to the PDF-compliant move_state algorithm. Set
+    `detector="hybrid"` to opt into the legacy contact+height+speed+landing
+    detector kept for backward compatibility.
+    """
+    detector = str(detector or "move_state").lower()
+    if detector == "move_state":
+        accepted = {"contact_threshold", "min_step_separation", "min_move_frames"}
+        ms_kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        return detect_move_state_steps(
+            foot_contact, start=start, end=end, foot=foot, **ms_kwargs,
+        )
+    if detector == "hybrid":
+        return _detect_steps_hybrid(
+            joints, foot_contact, start=start, end=end, foot=foot, **kwargs,
+        )
+    raise ValueError(f"Unknown step detector: {detector!r}")
+
+
+def detect_step_events(
+    joints: Optional[torch.Tensor],
+    foot_contact: torch.Tensor,
+    start: int = 0,
+    end: int = -1,
+    foot: str = "any",
+    *,
+    detector: str = "move_state",
+    **kwargs,
+) -> List[StepEvent]:
+    if detector == "move_state" or joints is None:
+        return detect_move_state_steps(
+            foot_contact,
+            start=start,
+            end=end,
+            foot=foot,
+            **{k: v for k, v in kwargs.items()
+               if k in {"contact_threshold", "min_step_separation", "min_move_frames"}},
+        ).events
+    return _detect_steps_hybrid(
+        joints, foot_contact, start=start, end=end, foot=foot, **kwargs,
+    ).events
+
+
+def count_steps(
+    joints: Optional[torch.Tensor],
+    foot_contact: torch.Tensor,
+    start: int = 0,
+    end: int = -1,
+    foot: str = "any",
+    *,
+    detector: str = "move_state",
+    **kwargs,
+) -> int:
+    return len(detect_step_events(
+        joints, foot_contact, start=start, end=end, foot=foot,
+        detector=detector, **kwargs,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Legacy hybrid detector (opt-in fallback)
+# ---------------------------------------------------------------------------
+
+
 def _fill_short_gaps(mask: torch.Tensor, max_gap: int) -> torch.Tensor:
     if max_gap <= 0 or mask.numel() == 0:
         return mask.bool()
-
     filled = mask.bool().clone()
     inactive_runs = _bool_runs(~filled)
     for start, end in inactive_runs:
@@ -72,23 +242,11 @@ def _fill_short_gaps(mask: torch.Tensor, max_gap: int) -> torch.Tensor:
     return filled
 
 
-def _foot_names(foot: str) -> Iterable[str]:
-    foot = str(foot or "any").lower()
-    if foot in {"any", "both"}:
-        return ("left", "right")
-    if foot in {"left", "l_foot", "left_foot"}:
-        return ("left",)
-    if foot in {"right", "r_foot", "right_foot"}:
-        return ("right",)
-    return ()
-
-
 def _event_near(events: List[StepEvent], foot: str, frame: int, min_sep: int) -> bool:
     return any(ev.foot == foot and abs(ev.key_frame - frame) < min_sep for ev in events)
 
 
 def _dedupe_events(events: List[StepEvent], min_separation: int) -> List[StepEvent]:
-    """Merge duplicate contact/landing detections for the same foot."""
     kept: List[StepEvent] = []
     for event in sorted(events, key=lambda ev: (ev.foot, ev.key_frame, -ev.confidence)):
         replace_idx: Optional[int] = None
@@ -106,7 +264,7 @@ def _dedupe_events(events: List[StepEvent], min_separation: int) -> List[StepEve
     return sorted(kept, key=lambda ev: ev.key_frame)
 
 
-def detect_steps(
+def _detect_steps_hybrid(
     joints: torch.Tensor,
     foot_contact: torch.Tensor,
     start: int = 0,
@@ -126,11 +284,11 @@ def detect_steps(
     landing_lookback: int = 8,
     landing_confidence: float = 0.8,
 ) -> StepDetectionResult:
-    """Detect physical steps from contact labels plus foot kinematics.
+    """Legacy hybrid step detector.
 
-    Contact-based events are accepted only when most frames in the contact run
-    are both near the ground and slow in XZ.  Landing events fill gaps when the
-    contact labels are absent but the foot visibly swings and settles.
+    Treats foot contact as a candidate event and validates it against foot
+    height and XZ speed; recovers steps from clean landing events when
+    contact labels are missing. Opt-in via `detector="hybrid"`.
     """
     if end == -1:
         end = int(min(joints.shape[0], foot_contact.shape[0]))
@@ -207,8 +365,6 @@ def detect_steps(
             ))
             contact_events += 1
 
-        # Contact labels can be missing after decoding.  Recover a step when a
-        # foot was clearly airborne recently and then settles near the ground.
         for frame in range(1, n_frames):
             if not landing_ground[frame].item() or not slow[frame].item():
                 continue
@@ -246,25 +402,3 @@ def detect_steps(
         contact_events=contact_events,
         landing_events=landing_events,
     )
-
-
-def detect_step_events(
-    joints: torch.Tensor,
-    foot_contact: torch.Tensor,
-    start: int = 0,
-    end: int = -1,
-    foot: str = "any",
-    **kwargs,
-) -> List[StepEvent]:
-    return detect_steps(joints, foot_contact, start, end, foot, **kwargs).events
-
-
-def count_steps(
-    joints: torch.Tensor,
-    foot_contact: torch.Tensor,
-    start: int = 0,
-    end: int = -1,
-    foot: str = "any",
-    **kwargs,
-) -> int:
-    return detect_steps(joints, foot_contact, start, end, foot, **kwargs).count

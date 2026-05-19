@@ -316,22 +316,34 @@ def _detect_physical_steps(
     foot_contact: torch.Tensor,
     start: int,
     end: int,
+    *,
+    detector: str = "move_state",
 ) -> Tuple[int, float]:
-    """Count steps through the shared hybrid detector.
+    """Count steps within a phase range.
 
-    The shared detector first validates contact runs with foot height and XZ
-    speed, then adds landing events when contact labels are missing.  Keeping
-    this wrapper preserves the old spatiotemporal reward interface.
+    Defaults to the New Reward PDF move_state formulation. Set
+    `detector="hybrid"` to opt into the legacy contact + height + speed +
+    landing detector (which uses `joints` for validation).
     """
-    result = detect_steps(
-        joints,
-        foot_contact,
-        start=start,
-        end=end,
-        max_contact_height=_FOOT_FLOAT_HEIGHT,
-        max_contact_speed=_FOOT_SLIDE_VEL,
-        min_valid_ratio=_VALID_CONTACT_RATIO,
-    )
+    if detector == "hybrid":
+        result = detect_steps(
+            joints,
+            foot_contact,
+            start=start,
+            end=end,
+            detector="hybrid",
+            max_contact_height=_FOOT_FLOAT_HEIGHT,
+            max_contact_speed=_FOOT_SLIDE_VEL,
+            min_valid_ratio=_VALID_CONTACT_RATIO,
+        )
+    else:
+        result = detect_steps(
+            joints,
+            foot_contact,
+            start=start,
+            end=end,
+            detector="move_state",
+        )
     return result.count, result.consistency_penalty
 
 
