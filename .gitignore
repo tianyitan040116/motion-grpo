@@ -45,6 +45,13 @@ generated_motions/
 grpo_output/
 experiments_grpo/
 
+# Test and monitoring scripts (local development only)
+test_*.py
+monitor_*.py
+watch_and_eval.py
+analyze_training_health*.py
+start_watcher.ps1
+
 # Checkpoints, pretrained models, and large binaries
 checkpoints/
 ckpt/
