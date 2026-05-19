@@ -1,14 +1,14 @@
-"""Step detector aligned with the New Reward specification.
+"""Step detector for reward and executor code.
 
-The canonical algorithm (see New Reward PDF, page 6) is:
+A step is a per-foot rest -> move transition derived from the foot-contact
+channels of the HumanML3D-style 263-dim feature:
 
-    l_move_state = (1 - l_foot_contact_in_263_feat) > 0.5
-    r_move_state = (1 - r_foot_contact_in_263_feat) > 0.5
-    -> count "rest -> move" rising edges per foot
+    move_state = (1 - foot_contact) > 0.5    # 1 = moving, 0 = in contact
+    step = rising edge in move_state         # rest -> move
 
-The legacy hybrid contact + height + speed detector is kept as an opt-in
-fallback for callers that explicitly request it via `detector="hybrid"`,
-but is no longer the default.
+A legacy hybrid detector that combines contact, foot height and XZ speed
+is kept as an opt-in fallback for callers that explicitly request it via
+`detector="hybrid"`, but is no longer the default.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def detect_move_state_steps(
     min_step_separation: int = 3,
     min_move_frames: int = 1,
 ) -> StepDetectionResult:
-    """Count steps using the New Reward PDF formula.
+    """Count steps from foot-contact channels.
 
     For each foot:
         move_state = (1 - foot_contact_channels) > contact_threshold
@@ -123,9 +123,9 @@ def detect_move_state_steps(
             if re - rs >= int(min_move_frames)
         ]
         # Only count runs that begin with a verifiable rest->move transition.
-        # A run that starts at frame 0 lacks an observable preceding rest state
-        # so it is not a confirmed rising edge -- the PDF example explicitly
-        # assumes the motion starts in a rest (contact) state.
+        # A run that starts at frame 0 lacks an observable preceding rest
+        # state, so it is not a confirmed rising edge -- we assume the motion
+        # begins in contact (rest).
         last_kept_frame: Optional[int] = None
         for run_start, run_end in runs:
             if run_start == 0:
@@ -168,9 +168,9 @@ def detect_steps(
 ) -> StepDetectionResult:
     """Top-level step detector.
 
-    Defaults to the PDF-compliant move_state algorithm. Set
-    `detector="hybrid"` to opt into the legacy contact+height+speed+landing
-    detector kept for backward compatibility.
+    Defaults to the move_state algorithm. Set `detector="hybrid"` to opt
+    into the legacy contact+height+speed+landing detector kept for
+    backward compatibility.
     """
     detector = str(detector or "move_state").lower()
     if detector == "move_state":

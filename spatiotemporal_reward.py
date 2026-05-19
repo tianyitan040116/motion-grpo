@@ -321,9 +321,9 @@ def _detect_physical_steps(
 ) -> Tuple[int, float]:
     """Count steps within a phase range.
 
-    Defaults to the New Reward PDF move_state formulation. Set
-    `detector="hybrid"` to opt into the legacy contact + height + speed +
-    landing detector (which uses `joints` for validation).
+    Defaults to the move_state formulation. Set `detector="hybrid"` to opt
+    into the legacy contact + height + speed + landing detector (which
+    uses `joints` for validation).
     """
     if detector == "hybrid":
         result = detect_steps(

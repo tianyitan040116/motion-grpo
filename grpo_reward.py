@@ -266,7 +266,7 @@ def _count_steps_in_range(
 ) -> int:
     """Count steps within a frame range.
 
-    Defaults to the New Reward PDF formulation: per foot,
+    Defaults to the move_state formulation: per foot,
     `move_state = (1 - foot_contact_channels) > 0.5`, then count rest->move
     rising edges. The legacy hybrid contact + height + speed + landing
     detector (which requires `joints`) is still available via
@@ -1111,8 +1111,8 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
 
     if 'clap' in text:
         target = _caption_number_hint(text, default=1.0)
-        # PDF spec (page 7): basin detection with hysteresis at threshold=0.077,
-        # exit_threshold = threshold * 1.6.
+        # Clap detection uses a two-threshold hysteresis state machine on
+        # inter-hand distance to avoid double-counting boundary jitter.
         specs.append({
             "id": "clap_count",
             "kind": "count",
@@ -1134,7 +1134,7 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
 
     if 'squat' in text:
         target = _caption_number_hint(text, default=1.0)
-        # PDF spec (page 8): drop threshold 0.15.
+        # A squat cycle requires the pelvis to dip by at least this much.
         specs.append({
             "id": "squat_count",
             "kind": "count",
@@ -1166,17 +1166,17 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
             foot = 'left'
         elif 'right' in text:
             foot = 'right'
-        # PDF spec (page 5): value = max(foot.y); reward = value > 0.08.
-        # `mode="binary_max"` emits at most one segment iff the peak foot
-        # height clears the threshold, matching the PDF formulation.
+        # Use the binary_max mode: a single event iff the peak foot height
+        # clears the threshold at some point, rather than counting every
+        # sustained period above it.
         _add_presence_rule(
             specs, 'raise_foot_present', 'raise_foot',
             {"foot": foot, "threshold": 0.08, "mode": "binary_max"}, weight=0.8,
         )
 
     if 'turn left' in text:
-        # PDF spec (page 5): require the turn to actually span enough frames
-        # (`time_threshold_frames`) on top of the cumulative angle check.
+        # Require the turn to span enough frames in addition to clearing the
+        # cumulative-angle check, otherwise momentary spikes count as turns.
         _add_presence_rule(
             specs, 'turn_left_present', 'turn_left',
             {"min_angle_deg": 20.0, "time_threshold_frames": 4}, weight=0.8,
@@ -1187,10 +1187,10 @@ def caption_to_executor_specs(caption: str) -> List[Dict[str, Any]]:
             {"min_angle_deg": 20.0, "time_threshold_frames": 4}, weight=0.8,
         )
 
-    # PDF spec (page 4) for "move forward / backward / left / right" emits
-    # a compound reward: cumulative positive displacement along the requested
-    # body axis must exceed a displacement threshold, AND the per-frame motion
-    # purity (pos_dis / (pos_dis + neg_dis)) must exceed a direction threshold.
+    # "move forward / backward / left / right" emits a compound reward:
+    # cumulative positive displacement along the requested body axis must
+    # exceed a displacement threshold, AND the per-frame motion purity
+    # (pos_dis / (pos_dis + neg_dis)) must exceed a direction threshold.
     # The two scalars combine additively at the executor level.
     direction_terms = [
         ('move forward', 'forward'),

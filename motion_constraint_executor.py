@@ -350,9 +350,10 @@ class MotionConstraintExecutor:
             return _to_numpy(pos[:, 1])
 
         if name == "foot_height":
-            # PDF spec (page 5): pos(foot).y, optionally offset by the minimum
-            # observed foot height so the result is foot height above the
-            # ground. Defaults to the right foot, matching the PDF example.
+            # Foot tip height. Defaults to the right foot; when
+            # `relative_to_ground=True` (default) we subtract the minimum
+            # observed foot height across both feet so the result is the
+            # foot's height above the inferred ground plane.
             foot = str(args.get("foot", "r_foot")).lower()
             joint_key = "l_foot" if foot in {"left", "l_foot"} else "r_foot"
             pos = self.resolve_entity_positions(cache, joint_key)
@@ -378,15 +379,11 @@ class MotionConstraintExecutor:
             return _to_numpy(speed)
 
         if name == "directional_displacement":
-            # PDF spec (page 4):
-            #   root_vel = compute_world_vel(pelvis)
-            #   body_vel_dir = root_vel . body_axes[dir]
-            #   pos_dis = cumsum(positive(body_vel_dir) * fps)
-            #   reward = pos_dis[last] > displace_thresh    (binary at the caller)
-            # Default `multiply_fps=False` keeps the historical units (raw
-            # cumulative displacement in body-scale units). Set
-            # `multiply_fps=True` to follow the PDF formula literally so a
-            # threshold can be specified in (body lengths / second).
+            # Cumulative positive displacement of `entity` along the requested
+            # body- or world-frame axis. With `multiply_fps=False` (default)
+            # the result is in raw units; with `multiply_fps=True` it is
+            # multiplied by fps so a threshold can be specified in
+            # units / second.
             entity = args.get("entity", "pelvis")
             direction = args.get("direction", "forward")
             frame = args.get("frame", "body")
@@ -507,10 +504,11 @@ class MotionConstraintExecutor:
         raise ValueError(f"Unknown template: {name}")
 
     def _template_step(self, cache: MotionCache, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # PDF spec (page 6): l/r_move_state = (1 - foot_contact_263) > 0.5,
-        # count rest->move rising edges per foot. The legacy hybrid detector
-        # (contact + height + speed + landing) is still reachable via
-        # `args["detector"] = "hybrid"` for backwards compatibility.
+        # Default to the move_state step detector: for each foot,
+        # move_state = (1 - foot_contact) > 0.5, and one step is one
+        # rest -> move rising edge. The hybrid contact + height + speed +
+        # landing detector is still reachable via `args["detector"] = "hybrid"`
+        # for callers that need the extra physical validation.
         foot = str(args.get("foot", "any")).lower()
         detector_kind = str(args.get("detector", "move_state")).lower()
         if detector_kind == "hybrid":
@@ -609,12 +607,15 @@ class MotionConstraintExecutor:
         return segments
 
     def _template_clap(self, cache: MotionCache, args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
-        # PDF spec (page 7): basin detection with hysteresis.
-        #   enter_threshold = threshold (default 0.077)
-        #   exit_threshold  = threshold * 1.6
-        # State machine on dist between hands: idle -> inside (dist <= enter)
-        # -> idle again only when dist > exit. Each completed (enter, exit)
-        # pair counts as one clap.
+        # Detect clap basins via a two-threshold hysteresis state machine on
+        # the inter-hand distance:
+        #   enter_threshold (default 0.077) -- hands must come at least this
+        #     close to register the start of a basin.
+        #   exit_threshold (default enter * 1.6) -- hands must separate past
+        #     this distance before the basin can close.
+        # Each completed (enter, exit) pair counts as one clap. The wider
+        # exit threshold prevents borderline jitter from being counted as
+        # multiple basins.
         threshold = float(args.get("threshold", 0.077))
         enter_threshold = float(args.get("enter_threshold", threshold))
         exit_threshold = float(args.get("exit_threshold", threshold * 1.6))
@@ -730,17 +731,16 @@ class MotionConstraintExecutor:
         return sorted(segments, key=lambda item: item["start"]), []
 
     def _template_raise_foot(self, cache: MotionCache, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # PDF spec (page 5):
-        #   r_foot_height = pos(r_foot).y
-        #   value = max(r_foot_height)
-        #   reward = value > threshold     (threshold = 0.08, binary)
-        # That collapses to a single segment iff the max foot height exceeds
-        # the threshold. mode="binary_max" implements PDF exactly; the legacy
-        # mode="segments" (default for backward compatibility) instead emits
-        # one segment per sustained period above the threshold so callers can
-        # use count semantics (e.g. "raise the right foot twice"). To opt into
-        # the PDF formulation, also expose `signal:foot_height` with
-        # reduce="max".
+        # Two output modes are supported:
+        #   mode="segments" (default, backward compatible): emit one segment
+        #     per sustained period where the foot is above `threshold`, so a
+        #     caller can ask for things like "raise the right foot twice".
+        #   mode="binary_max": emit at most one segment iff the peak foot
+        #     height across the clip clears the threshold -- a single binary
+        #     "did the foot lift high enough at some point?" event.
+        # The companion `signal:foot_height` with reduce="max" is the more
+        # ergonomic way to express the binary_max behaviour as a signal
+        # constraint.
         foot = str(args.get("foot", "any")).lower()
         threshold = float(args.get("threshold", 0.08))
         min_frames = int(args.get("min_frames", 2))
@@ -798,16 +798,12 @@ class MotionConstraintExecutor:
         return sorted(segments, key=lambda item: item["start"])
 
     def _template_squat(self, cache: MotionCache, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # PDF spec (page 7-8):
-        #   values = pos(pelvis).y
-        #   local_min = local_find(values)
-        #   left_peak = walk_local_peak_left(local_min)
-        #   right_peak = walk_local_peak_right(local_min)
-        #   drop = min(left_peak, right_peak) - local_min
-        #   event = drop >= threshold     (threshold = 0.15)
-        # `walk_local_peak_{left,right}` walks outward from each local minimum
-        # until the height stops increasing -- i.e. it finds the nearest local
-        # maximum on each side rather than capping at a fixed window.
+        # A squat cycle is a local minimum in pelvis height whose drop from
+        # both surrounding local maxima exceeds `threshold`. We find each
+        # local minimum, then walk outward from it to the nearest local
+        # maximum on either side (rather than capping at a fixed window),
+        # and accept the cycle iff the smaller of the two drops is large
+        # enough.
         pelvis_y = self.signal(cache, "height", {"entity": "pelvis"})
         threshold = float(args.get("threshold", 0.15))
         segments: List[Dict[str, Any]] = []
@@ -842,16 +838,17 @@ class MotionConstraintExecutor:
         return segments
 
     def _template_turn(self, cache: MotionCache, args: Dict[str, Any], direction: str) -> List[Dict[str, Any]]:
-        # PDF spec (page 5):
-        #   yaw_vel = root_rot_vel_in_263_feat (motion_raw[:, 0]); 2x for half-angle convention
-        #   angle = sum(yaw_vel) in degrees
-        #   tl_state = (yaw_vel/threshold).clip(0, None) > threshold  (per-frame "actively turning")
-        #   angle_flag = angle in (min_angle, max_angle)
-        #   reward = time(tl_state) > time_threshold if angle_flag else 0
-        # Per-frame active mask is preserved as before; we additionally enforce
-        # the max_angle gate and an explicit time_threshold so segments that do
-        # not actually meet the PDF criteria are filtered out (yielding zero
-        # reward downstream).
+        # A turn is a contiguous run of frames where the signed yaw velocity
+        # is consistently in the requested direction. We accept a run only
+        # when:
+        #   - its accumulated angle lies in [min_angle_deg, max_angle_deg],
+        #     so partial twitches and unrealistic over-rotations are both
+        #     rejected; and
+        #   - it lasts at least `time_threshold_frames`, so a long enough
+        #     stretch of sustained turning is required (not a momentary
+        #     spike).
+        # The 2x factor on yaw matches the half-angle convention used by
+        # HumanML3D's 263-dim feature for root rotation.
         min_angle = float(args.get("min_angle_deg", 20.0))
         max_angle = float(args.get("max_angle_deg", float("inf")))
         min_frames = int(args.get("min_frames", max(2, round(0.2 * cache.fps))))
