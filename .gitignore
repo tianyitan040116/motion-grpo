@@ -52,6 +52,13 @@ watch_and_eval.py
 analyze_training_health*.py
 start_watcher.ps1
 
+# Local utility and example files
+example_prompt.txt
+requirements_no_git.txt
+requirements_no_torch.txt
+visualize_motion.py
+visualize_motion_fixed.py
+
 # Checkpoints, pretrained models, and large binaries
 checkpoints/
 ckpt/
