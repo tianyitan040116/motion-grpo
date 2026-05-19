@@ -1,0 +1,79 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+site/
+
+# Virtual environments
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+venv_grpo/
+
+# Notebook and editor files
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and local outputs
+*.log
+*.out
+nohup.out
+smoke_test_output/
+generated_motions/
+grpo_output/
+experiments_grpo/
+
+# Checkpoints, pretrained models, and large binaries
+checkpoints/
+ckpt/
+pretrained/
+glove/
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
+node-v20.18.0-linux-x64.tar.xz
+
+# Local datasets and downloaded payloads
+dataset.zip
+dataset/__pycache__/
+dataset/*.npy
+dataset/*.txt
+dataset/joints/
+dataset/new_joints/
+dataset/new_joint_vecs/
+dataset/pose_data/
+dataset/texts/
+
+# Keep dataset source code tracked
+!dataset/*.py
+
+# Misc local tooling artifacts
+demo
+experiments
