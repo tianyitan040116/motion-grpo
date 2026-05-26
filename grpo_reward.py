@@ -2798,12 +2798,17 @@ class GRPORewardModel:
         length_frac = motion_lengths.float() / motion_lengths.float().clamp(min=1).max()
         length_penalty = self.length_penalty_weight * length_frac
 
-        # Energy-gate scaling (P0.C, post-run1 fix).
-        # We scale physical (only when positive -- never reduce a stillness
-        # penalty) and caption_sat by the per-sample gate. cos_sim_01 is
-        # left alone so the model keeps a baseline gradient toward "look
-        # like a human" even when energy gate fails; physical and cap_sat
-        # carry the "do the action" gradient.
+        # Energy-gate scaling (P0.C + P2.B post-adversarial-audit).
+        # Originally the gate was applied only to physical + caption_sat to
+        # preserve a "look like a human" baseline via cos_sim_01. The
+        # adversarial audit showed frozen samples kept cos_sim ~0.88 (the
+        # eval_wrapper's text-motion encoder is happy with any plausible
+        # human pose), so leaving cos_sim ungated gave frozen samples too
+        # much of the total reward. Now the gate multiplies cos_sim too:
+        # the gate's 0.25 floor still preserves a baseline gradient (gate=0.25
+        # means the reward keeps 25% of every branch), but a sample that
+        # fully misses the prompt's energy requirement loses ~75% of total.
+        cos_sim_gated = cos_sim_01 * energy_gates
         physical_gated = torch.where(
             physical_scores > 0,
             physical_scores * energy_gates,
@@ -2812,7 +2817,7 @@ class GRPORewardModel:
         caption_sat_gated = caption_sat * energy_gates
 
         rewards = (
-            w_match * cos_sim_01
+            w_match * cos_sim_gated
             + w_phys * physical_gated
             + w_cap * caption_sat_gated
             - length_penalty
@@ -2863,6 +2868,7 @@ class GRPORewardModel:
         if return_components:
             return rewards, {
                 'matching_scores': cos_sim,
+                'cos_sim_gated': cos_sim_gated,
                 'physical_scores': physical_scores,
                 'physical_gated': physical_gated,
                 'numerical_scores': numerical_scores,
@@ -2995,26 +3001,22 @@ class GRPORewardModel:
     ) -> torch.Tensor:
         """Collapse caption-aware reward branches into one [0,1] score.
 
-        Composition rules (tuned against audit/reward_group_eval.py at K=4):
+        Composition rules (n=300 real-data audit, post-P0-P3):
           numeric caption:
               0.55 * numerical_scores
-            + 0.15 * executor_scores  (when has_executor)
+            + 0.05 * executor_scores  (when has_executor)
             + 0.05 * kinematic_scores (when has_kinematic)
-            + 0.25 * cos_sim_01
-              -> rank-1 ~63% on numeric bucket; numerical signal carries.
-          direction-only caption:
+            + 0.35 * cos_sim_01
+            -- executor weight dropped 0.15 -> 0.05 because the executor
+            branch failed to discriminate matched vs mismatched in the
+            audit (Δ 0.015). The released ~0.10 budget shifted to matching
+            (cos_sim_01), which IS the dominant signal (Δ 0.116).
+          direction-only / pure caption:
               cos_sim_01 only
-              -> empirically the "geometric" direction/executor specs are
-                 active negative signal on this bucket: the audit showed
-                 full reward at 25% rank-1 vs matching-only at 45%. The
-                 evaluator's cosine already encodes caption-motion semantic
-                 match including directional cues, and our geometric specs
-                 reward any forward walk regardless of which caption-bound
-                 direction was requested. Until those specs can actually
-                 distinguish "walks left" from "walks forward" reliably,
-                 deferring to matching alone is the better trade.
-          pure caption:
-              cos_sim_01  -- the only signal available.
+              -- direction specs were too noisy to be useful as the sole
+              signal (see audit log); deferring to matching alone is the
+              safer trade until they can distinguish e.g. "walks left"
+              from "walks forward" reliably.
         """
         B = numerical_scores.shape[0]
         sat = torch.zeros(B, device=numerical_scores.device,
@@ -3028,7 +3030,7 @@ class GRPORewardModel:
                 has_kin = bool(has_kinematic[i].item() > 0)
                 e = float(executor_scores[i].item()) if has_exec else 0.0
                 k = float(kinematic_scores[i].item()) if has_kin else 0.0
-                sat[i] = 0.55 * n + 0.15 * e + 0.05 * k + 0.25 * c
+                sat[i] = 0.55 * n + 0.05 * e + 0.05 * k + 0.35 * c
             else:
                 # direction_only and pure both fall back to matching.
                 sat[i] = c
