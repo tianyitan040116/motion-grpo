@@ -183,9 +183,15 @@ def _event_count_reward(measured: float, target: float, tolerance: float, weight
     # steps" vs "walk 10 steps"), and the unnormalized form makes large-target
     # prompts dominate the advantage signal. Keeping the per-target scale
     # uniform here trades strict schema fidelity for cross-prompt stability.
+    #
+    # Score formula uses a hard linear ramp `max(0, 1 - normalized)` (P2 fix,
+    # post-run1). The old `exp(-normalized)` gave a frozen-in-place sample
+    # (measured=0, target=N) a score of exp(-1)=0.37, leaking ~5.5% of total
+    # reward into the executor branch for samples that did literally nothing.
+    # Linear: score=1.0 when perfect, 0 when off by >=target, linear in between.
     violation = compare_violation(measured, "eq", target, tolerance)
     normalized = violation / max(abs(float(target)), 1.0)
-    score = math.exp(-normalized)
+    score = max(0.0, 1.0 - normalized)
     reward = -float(weight) * normalized
     return violation, reward, score
 

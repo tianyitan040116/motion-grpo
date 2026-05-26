@@ -775,9 +775,12 @@ def _required_minimum_energy(
     if parsed is not None:
         for c in parsed.numerical_constraints:
             if c.type == 'steps':
-                # Adult step ~0.7m; require >= 0.3m * N as the bare minimum
-                # to count as "took the steps".
-                req['path_m'] = max(req['path_m'], 0.30 * float(c.value))
+                # Adult step ~0.7m, but VQ-VAE round-trip degrades root path
+                # by 40-60% (audit on real GT: 3-step prompts gate at 0.66
+                # with 0.30 m/step floor). Drop to 0.20 m/step so a real
+                # walking GT clears the floor while a fully-stationary
+                # collapse (run1 walk3m at 0.32 m) still gets gate ~0.40.
+                req['path_m'] = max(req['path_m'], 0.20 * float(c.value))
             elif c.type == 'degrees':
                 # Require 40% of the requested rotation (in radians).
                 req['yaw_rad'] = max(req['yaw_rad'],
@@ -788,7 +791,7 @@ def _required_minimum_energy(
 
     # Verb-fallback floors (active even with empty parsed constraints).
     if _RE_LOCOMOTION.search(caption):
-        req['path_m'] = max(req['path_m'], 0.30)
+        req['path_m'] = max(req['path_m'], 0.20)
     if _RE_ROTATION.search(caption):
         req['yaw_rad'] = max(req['yaw_rad'], 0.50)
     if _RE_VERTICAL.search(caption):

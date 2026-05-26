@@ -133,16 +133,22 @@ def get_grpo_args():
                         help='Number of motion samples to generate per caption (G)')
     parser.add_argument('--grpo-beta', type=float, default=0.04,
                         help='KL penalty coefficient against frozen SFT reference')
-    parser.add_argument('--grpo-kl-target', type=float, default=5.0,
-                        help='KL divergence vs frozen SFT; early exit inner loop if exceeded')
+    parser.add_argument('--grpo-kl-target', type=float, default=2.0,
+                        help='KL divergence vs frozen SFT; early exit inner loop if exceeded. '
+                             'Lowered 5.0->2.0 post-run1: collapse happened around sft_kl ~1.1 '
+                             'while target=5 never tripped, leaving the early-exit effectively off.')
     parser.add_argument('--inner-steps', type=int, default=3,
                         help='Number of inner optimization steps per batch (K in GRPO)')
     parser.add_argument('--grpo-clip-epsilon', type=float, default=0.2,
                         help='PPO-style clipping epsilon (ratio clipped to [1-eps, 1+eps])')
     parser.add_argument('--reward-scale', type=float, default=1.0,
                         help='Scaling factor for rewards')
-    parser.add_argument('--reward-length-penalty', type=float, default=0.01,
-                        help='Penalty per generated length fraction; discourages max-length run-ons')
+    parser.add_argument('--reward-length-penalty', type=float, default=0.0,
+                        help='Penalty per generated length fraction. P0 fix post-run1: was 0.01 '
+                             'which actively rewards shorter outputs (longest sample loses 0.01 reward, '
+                             'shortest loses 0). Combined with the stand-still attractor this nudges the '
+                             'policy toward short frozen samples. Default zero unless you have a specific '
+                             'reason to penalize length.')
     parser.add_argument('--reward-tau', type=float, default=0.1,
                         help='Temperature for InfoNCE reward (default 0.1)')
     parser.add_argument('--physical-weight', type=float, default=0.5,
@@ -175,7 +181,10 @@ def get_grpo_args():
                         help='Path to GRPO checkpoint to resume training')
 
     # Validation
-    parser.add_argument('--epochs-start-val', type=int, default=2, help='start validation after N epochs')
+    parser.add_argument('--epochs-start-val', type=int, default=0,
+                        help='start validation after N epochs (0=validate after epoch 0). '
+                             'Default changed 2->0 post-run1 so the validation pass is available as '
+                             'an early check for collapse rather than after the bug has fully baked.')
     parser.add_argument('--epochs-val-interval', type=int, default=2, help='validation interval')
     parser.add_argument('--checkpoint-every-batches', type=int, default=25,
                         help='persist trainer state every N batches for resume')
