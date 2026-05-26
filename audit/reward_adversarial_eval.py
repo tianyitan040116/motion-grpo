@@ -176,7 +176,42 @@ def variant_half_length(raw: np.ndarray) -> np.ndarray:
     return raw[:T]
 
 
-VARIANTS = ['identity', 'frozen', 'drift_only', 'shuffled', 'half_length']
+def variant_reverse_time(raw: np.ndarray) -> np.ndarray:
+    """Play the motion backward. Per-frame poses unchanged, but root velocity
+    channels flip sign so the body translates the opposite way. Critical
+    test for the reward's directional awareness."""
+    rev = raw[::-1].copy()
+    # Root angular vel (yaw) and root XZ vel are velocities (frame-to-frame).
+    # When we flip frames, the inferred velocities should also flip sign to
+    # describe motion in the new ordering. Channel layout:
+    #   0: root yaw vel, 1-2: root XZ vel, 3: root Y (absolute), 4..: joints.
+    # We flip the *velocity* channels.
+    rev[:, 0:3] = -rev[:, 0:3]
+    return rev
+
+
+def variant_mirror_lr(raw: np.ndarray) -> np.ndarray:
+    """Mirror left <-> right across the sagittal plane. X-axis joints flip,
+    root XZ-x velocity flips. Direction-sensitive captions like 'turns
+    right' should now read as 'turns left'."""
+    out = raw.copy()
+    # Channel 1 = root linear X velocity (in body frame). Flip.
+    out[:, 1] = -out[:, 1]
+    # Joint local positions live at channels 4 : 4 + 21*3 = 4:67 (HumanML3D
+    # 22-joint with root excluded). Flip x-coord (every 3rd starting at 0).
+    out[:, 4:4 + 21 * 3:3] = -out[:, 4:4 + 21 * 3:3]
+    # Yaw velocity (channel 0) also flips because left turns -> right turns.
+    out[:, 0] = -out[:, 0]
+    # Foot contact channels at 259:263 -- swap the L/R pairs (left foot:
+    # joints 7,10; right foot: 8,11). HumanML3D layout puts them as
+    # [L_ankle, L_foot, R_ankle, R_foot]. Swap pairs.
+    if out.shape[1] >= 263:
+        out[:, [259, 260, 261, 262]] = out[:, [261, 262, 259, 260]]
+    return out
+
+
+VARIANTS = ['identity', 'frozen', 'drift_only', 'shuffled', 'half_length',
+            'reverse_time', 'mirror_lr']
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +286,10 @@ def main():
                 arr = variant_shuffled(p['raw'], random.Random(args.seed + i))
             elif v == 'half_length':
                 arr = variant_half_length(p['raw'])
+            elif v == 'reverse_time':
+                arr = variant_reverse_time(p['raw'])
+            elif v == 'mirror_lr':
+                arr = variant_mirror_lr(p['raw'])
             tok = encode(vq, arr, args.device)
             if tok.numel() == 0:
                 continue

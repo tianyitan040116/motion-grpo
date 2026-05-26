@@ -731,14 +731,25 @@ def _compute_motion_energy(
     joint_pos: torch.Tensor,
     motion_raw: torch.Tensor,
 ) -> Dict[str, float]:
-    """Measure actual motion energy on four axes.
+    """Measure actual motion energy on multiple axes.
 
-    Returns dict {path_m, yaw_rad, y_range_m, rel_speed} -- the same keys
-    used by `_required_minimum_energy` so the gate can compare per-axis.
+    Returns dict with keys consumed by `_required_minimum_energy` /
+    `motion_energy_gate`. Magnitude axes are non-negative; signed axes
+    carry direction so the gate can fire when the motion goes the wrong
+    way for a directional caption (the audit caught this: id_real vs
+    caption-direction-inverted scored identically Δ=0.000 before this fix).
+
+    HumanML3D normalizes the first-frame root facing to +Z in world frame,
+    so signed_forward_m = (root_z[-1] - root_z[0]) is positive when the
+    body walked forward relative to its initial orientation. signed_left_m
+    uses world +X = left (HumanML3D convention).
     """
     T = joint_pos.shape[0]
     if T < 2:
-        return {'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0}
+        return {
+            'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0,
+            'signed_forward_m': 0.0, 'signed_left_m': 0.0,
+        }
 
     root_xz = joint_pos[:, 0, [0, 2]]
     path_m = float(torch.norm(root_xz[1:] - root_xz[:-1], dim=-1).sum().item())
@@ -753,12 +764,33 @@ def _compute_motion_energy(
     rel_vel = torch.norm(rel_pos[1:] - rel_pos[:-1], dim=-1)
     rel_speed = float(rel_vel.mean().item())
 
+    # Signed world-frame displacement from frame 0 to last frame. With
+    # HumanML3D's facing-aligned normalization, +Z = initial forward,
+    # +X = initial left.
+    signed_forward_m = float((joint_pos[-1, 0, 2] - joint_pos[0, 0, 2]).item())
+    signed_left_m = float((joint_pos[-1, 0, 0] - joint_pos[0, 0, 0]).item())
+
     return {
         'path_m': path_m,
         'yaw_rad': yaw_rad,
         'y_range_m': y_range_m,
         'rel_speed': rel_speed,
+        'signed_forward_m': signed_forward_m,
+        'signed_left_m': signed_left_m,
     }
+
+
+_RE_FORWARD = re.compile(r'\b(forward|forwards|ahead|onward)\b', re.IGNORECASE)
+_RE_BACKWARD = re.compile(r'\b(backward|backwards|retreat)\b', re.IGNORECASE)
+# Disable signed-forward gate when the caption implies multi-phase trajectory.
+# "then" splits temporal phases; "turn around" / "turns around" reverses
+# direction mid-clip. Either case can yield net signed displacement opposite
+# to the stated initial direction (real dataset sample 000032: "walks
+# forward, then turns around and walks forward" -> signed_fwd = -1.0).
+_RE_MULTI_PHASE = re.compile(
+    r'\b(then|turn(s|ed)?\s+around|reverse|comes?\s+back|go(es)?\s+back)\b',
+    re.IGNORECASE,
+)
 
 
 def _required_minimum_energy(
@@ -769,8 +801,17 @@ def _required_minimum_energy(
     on each axis. Thresholds are deliberately conservative -- they catch
     "did nothing" without double-penalizing models that mostly got it
     right (numerical_score already grades closeness).
+
+    Signed axes (signed_forward_m, signed_left_m) carry direction: a
+    positive value means the motion must travel in that signed direction,
+    a negative value means it must travel the opposite way. The gate uses
+    `actual / required` which works for both signs (same-sign -> positive
+    ratio, opposite-sign -> negative, clamped to zero).
     """
-    req = {'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0}
+    req = {
+        'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0,
+        'signed_forward_m': 0.0, 'signed_left_m': 0.0,
+    }
 
     if parsed is not None:
         for c in parsed.numerical_constraints:
@@ -799,6 +840,26 @@ def _required_minimum_energy(
     if _RE_GENERIC_MOTION.search(caption):
         req['rel_speed'] = max(req['rel_speed'], 0.0015)
 
+    # Directional floors (post-audit fix; reward was direction-blind).
+    # Only apply when the caption is UNAMBIGUOUSLY single-direction.
+    # Edge cases that DISABLE the signed gate:
+    #   - Caption contains both forward & backward (or both left & right)
+    #   - Caption contains multi-phase markers like "then" or "turn around"
+    #     that imply non-linear trajectory (real example from dataset:
+    #     "walks forward, then turns around and walks forward" with net
+    #     signed_forward = -1.0m)
+    # Left/right disabled entirely: probe (audit/probe_lr_convention.py)
+    # showed HumanML3D doesn't enforce a consistent +X = left convention;
+    # both signs occur for "walks left" captions.
+    multi_phase = bool(_RE_MULTI_PHASE.search(caption))
+    has_fwd = bool(_RE_FORWARD.search(caption))
+    has_bwd = bool(_RE_BACKWARD.search(caption))
+    if not multi_phase:
+        if has_fwd and not has_bwd:
+            req['signed_forward_m'] = +0.15
+        elif has_bwd and not has_fwd:
+            req['signed_forward_m'] = -0.15
+
     return req
 
 
@@ -809,21 +870,33 @@ def motion_energy_gate(
 ) -> float:
     """Return value in [floor, 1.0] -- multiplicative factor on the reward.
 
-    For each required axis (>0), compute satisfaction ratio in [0, 1].
+    For each required axis (non-zero), compute satisfaction ratio in [0, 1].
     Take the MIN over axes (one missing axis is enough to fail). Lerp from
     `floor` (full miss) to 1.0 (full satisfy) so the gradient stays alive
     instead of cliffing to zero.
+
+    Signed axes (e.g., signed_forward_m for "walks forward" prompts):
+    `actual / required` is positive when both have the same sign (right
+    direction), negative when the model moves the opposite way. clamp to
+    [0,1] handles both: same-sign-large-magnitude -> 1.0, wrong-sign or
+    near-zero -> 0.0.
 
     Floor 0.25 means a fully-frozen sample sees its reward weighted at 25%,
     while a perfectly-executed sample sees 100%. The training signal in
     between is monotonic.
     """
-    active = [k for k, v in required.items() if v > 0]
+    active = [k for k, v in required.items() if v != 0]
     if not active:
         return 1.0
     min_ratio = 1.0
     for k in active:
-        ratio = actual.get(k, 0.0) / max(required[k], 1e-6)
+        req = required[k]
+        act = actual.get(k, 0.0)
+        # `act / req` is positive iff act and req have the same sign.
+        # For magnitude axes (req > 0) this is the usual satisfaction ratio.
+        # For signed axes (req can be negative) wrong-sign actual -> negative
+        # ratio -> clamped to 0 (full penalty).
+        ratio = act / req
         ratio = min(1.0, max(0.0, ratio))
         if ratio < min_ratio:
             min_ratio = ratio
