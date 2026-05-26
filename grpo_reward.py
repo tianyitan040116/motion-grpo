@@ -47,12 +47,22 @@ class Direction(Enum):
 
 @dataclass
 class ConstraintPhase:
-    """A parsed constraint from the caption with direction and temporal order."""
+    """A parsed constraint from the caption with direction and temporal order.
+
+    `value` is the representative (center) target. When the caption is vague
+    ("a few steps", "a circle"), `value_min` / `value_max` bracket the
+    plausible range and the scoring functions give full credit anywhere
+    inside it. When the caption is precise ("3 steps", "180 degrees"), both
+    bounds are None and the legacy point-target Gaussian is used.
+    For `degrees`, a negative `value` means clockwise; positive = CCW.
+    """
     type: str           # 'steps', 'degrees', 'repetitions'
-    value: float        # numeric target
+    value: float        # numeric target (signed for degrees)
     direction: Direction
     order: int          # temporal position (0-based)
     raw: str            # original matched text
+    value_min: Optional[float] = None
+    value_max: Optional[float] = None
 
 @dataclass
 class MotionPhase:
@@ -115,18 +125,21 @@ _NUM_PATTERNS = [
     # "a couple/few steps"
     (r'a\s+couple(?:\s+of)?\s+steps?', 'steps_couple'),
     (r'a\s+few\s+steps?', 'steps_few'),
+    (r'several\s+steps?', 'steps_several'),
     # "a step" / "a small step"
     (r'\ba\s+(?:small\s+|large\s+|big\s+)?steps?\b', 'steps_one'),
     # "N times"
     (r'(\d+)\s+times?', 'repetitions'),
     (r'(twice)', 'repetitions'),
     (rf'({_WORD_NUM})\s+times?', 'repetitions'),
-    # "N degrees"
-    (r'(\d+)\s*degrees?', 'degrees'),
-    # "half circle" / "half the circle" (must come before "circle")
+    # "N degrees" -- but NOT "N degree(s) angle" (a posture, not a body rotation)
+    (r'(\d+)\s*degrees?(?!\s+angle)', 'degrees'),
+    # "quarter circle" -- must come before "circle"
+    (r'(?:a\s+|the\s+)?quarter[-\s]+(?:of\s+a\s+)?circle', 'degrees_quarter_circle'),
+    # "half circle" / "half the circle" -- must come before "circle"
     (r'half\s+(?:the\s+|a\s+)?circle', 'degrees_half_circle'),
-    # "circle" (but not preceded by "half ")
-    (r'(?<!half\s)(?:the\s+|a\s+)?circle', 'degrees_full_circle'),
+    # generic "circle" (not preceded by half/quarter)
+    (r'(?<!half\s)(?<!quarter\s)(?<!quarter-)(?:the\s+|a\s+)?circle', 'degrees_full_circle'),
 ]
 
 # Temporal clause delimiters
@@ -148,22 +161,51 @@ _DIRECTION_PATTERNS = [
 ]
 
 
+# Spin direction patterns (orthogonal to translation direction).
+# Sign convention determined empirically from HumanML3D root_rot_vel
+# integration: positive cumulative yaw = clockwise (CW) / right turn.
+# (The legacy docstring on _measure_rotation_signed claimed the opposite
+# but disagreed with the data; spot-checking captioned CW/CCW circles
+# confirmed CW measures positive.)
+_SPIN_CW = re.compile(r'\b(?:clockwise|cw)\b')
+_SPIN_CCW = re.compile(r'\b(?:counter[-\s]*clockwise|counterclockwise|anti[-\s]*clockwise|ccw)\b')
+
+
+def _extract_spin_sign(text: str) -> Optional[int]:
+    """Return +1 for CW (positive yaw), -1 for CCW, None if absent.
+
+    CCW pattern checked first because 'counter clockwise' contains 'clockwise'.
+    """
+    if _SPIN_CCW.search(text):
+        return -1
+    if _SPIN_CW.search(text):
+        return +1
+    return None
+
+
 def _extract_direction(text: str, match_start: int = -1, match_end: int = -1) -> Direction:
     """Extract movement direction from text, preferring context near the match.
 
-    If match_start/end are given, look within a local window (30 chars) around
-    the match first. Fall back to scanning the full text.
+    Window strategy (tightest first, to avoid bleed from adjacent clauses):
+      1. text immediately following the match (next ~15 chars)
+      2. text immediately preceding the match (prev ~15 chars)
+      3. fall back to the whole text passed in (caller already restricts to clause)
     """
-    # Local context window around the numeric match
     if match_start >= 0 and match_end >= 0:
-        local_start = max(0, match_start - 30)
-        local_end = min(len(text), match_end + 30)
-        local = text[local_start:local_end]
+        # 1. forward window: "2 steps to the right"
+        fwd_end = min(len(text), match_end + 15)
+        fwd = text[match_end:fwd_end]
         for pat, direction in _DIRECTION_PATTERNS:
-            if pat.search(local):
+            if pat.search(fwd):
+                return direction
+        # 2. backward window: "right 2 steps"
+        bwd_start = max(0, match_start - 15)
+        bwd = text[bwd_start:match_start]
+        for pat, direction in _DIRECTION_PATTERNS:
+            if pat.search(bwd):
                 return direction
 
-    # Fall back to full text
+    # 3. full text (already restricted to clause by caller)
     for pat, direction in _DIRECTION_PATTERNS:
         if pat.search(text):
             return direction
@@ -174,8 +216,18 @@ def parse_numerical_constraints(caption: str) -> List[ConstraintPhase]:
     """Extract numerical constraints with direction and temporal ordering.
 
     Splits caption into temporal clauses, then extracts numeric patterns
-    with associated direction from each clause. No deduplication - allows
-    "3 steps right, then 3 steps left" to produce two separate constraints.
+    with associated direction from each clause. Within a clause, duplicate
+    (type, value, direction) triples are merged so "three times ... three
+    times" in a non-temporal context produces one constraint, not two.
+    Across clauses (separated by then/before/after/etc) duplicates are kept
+    because they reflect distinct phases ("3 steps right, then 3 steps left").
+
+    For `degrees`, value is signed: positive = CCW / left turn, negative =
+    CW / right turn (matches HumanML3D root_rot_vel integration convention).
+
+    Vague quantifiers ("a step", "a few", "a circle", "quarter circle")
+    populate value_min / value_max on ConstraintPhase so downstream scoring
+    can give full credit anywhere inside the range.
     """
     text = caption.lower()
 
@@ -198,6 +250,10 @@ def parse_numerical_constraints(caption: str) -> List[ConstraintPhase]:
 
     for order, (c_start, c_end) in enumerate(clause_spans):
         clause = text[c_start:c_end]
+        spin_sign = _extract_spin_sign(clause)
+        # de-dup within a single clause: a "3 steps" mentioned in one breath
+        # twice is one constraint, not two.
+        clause_seen: set = set()
 
         for pattern, ctype in _NUM_PATTERNS:
             for m in re.finditer(pattern, clause):
@@ -212,21 +268,38 @@ def parse_numerical_constraints(caption: str) -> List[ConstraintPhase]:
                 # Extract direction from local context around this match
                 match_dir = _extract_direction(clause, m.start(), m.end())
 
-                # Resolve value
+                # Resolve value / range
+                value_min: Optional[float] = None
+                value_max: Optional[float] = None
                 if ctype == 'steps_one':
                     value = 1.0
+                    value_min, value_max = 1.0, 3.0
                     ctype = 'steps'
                 elif ctype == 'steps_couple':
                     value = 2.0
+                    value_min, value_max = 2.0, 4.0
                     ctype = 'steps'
                 elif ctype == 'steps_few':
                     value = 3.0
+                    value_min, value_max = 2.0, 5.0
                     ctype = 'steps'
+                elif ctype == 'steps_several':
+                    value = 4.0
+                    value_min, value_max = 3.0, 6.0
+                    ctype = 'steps'
+                elif ctype == 'degrees_quarter_circle':
+                    value = 90.0
+                    value_min, value_max = 45.0, 135.0
+                    ctype = 'degrees'
                 elif ctype == 'degrees_half_circle':
                     value = 180.0
+                    value_min, value_max = 120.0, 240.0
                     ctype = 'degrees'
                 elif ctype == 'degrees_full_circle':
                     value = 360.0
+                    # Human-walked "circles" in HumanML3D rarely close fully;
+                    # empirically GT circles measure 180-540 deg (median ~250).
+                    value_min, value_max = 180.0, 540.0
                     ctype = 'degrees'
                 else:
                     raw = m.group(1) if m.lastindex else m.group(0)
@@ -240,12 +313,34 @@ def parse_numerical_constraints(caption: str) -> List[ConstraintPhase]:
                         except ValueError:
                             continue
 
+                # Apply spin sign to degrees if caption named clockwise/CCW.
+                # Otherwise leave unsigned (value > 0); downstream code that
+                # cares about sign will use direction (LEFT/RIGHT) if present.
+                if ctype == 'degrees' and spin_sign is not None:
+                    value = abs(value) * spin_sign
+                    if value_min is not None and value_max is not None:
+                        lo, hi = abs(value_min), abs(value_max)
+                        if spin_sign < 0:
+                            value_min, value_max = -hi, -lo
+                        else:
+                            value_min, value_max = lo, hi
+
+                # Within-clause dedupe key: same target + same direction =
+                # same constraint, even if the literal raw text differs.
+                # Note: spin sign already baked into value for degrees.
+                key = (ctype, value, match_dir)
+                if key in clause_seen:
+                    continue
+                clause_seen.add(key)
+
                 constraints.append(ConstraintPhase(
                     type=ctype,
                     value=value,
                     direction=match_dir,
                     order=order,
                     raw=m.group(0),
+                    value_min=value_min,
+                    value_max=value_max,
                 ))
 
     return constraints
@@ -254,6 +349,90 @@ def parse_numerical_constraints(caption: str) -> List[ConstraintPhase]:
 # ---------------------------------------------------------------------------
 # Motion feature extraction (operates on denormalized motion)
 # ---------------------------------------------------------------------------
+
+
+def denormalize_motion(motion, mean, std):
+    """Denormalize HumanML3D-style 263-dim motion. Thin wrapper over
+    `motion * std + mean` so the reward path and audit/smoke scripts go
+    through one definition.
+
+    Note: HumanML3D's normalized "zero motion" decodes to an "average walking
+    person" because MEAN encodes a non-zero forward velocity. That is data
+    semantics, not a bug -- a truly stationary motion in normalized space is
+    `(-MEAN/STD)`, not 0. Tests that need a real static pose should build
+    it explicitly.
+    """
+    if isinstance(motion, torch.Tensor):
+        if not isinstance(mean, torch.Tensor):
+            mean_t = torch.as_tensor(mean, dtype=motion.dtype, device=motion.device)
+            std_t = torch.as_tensor(std, dtype=motion.dtype, device=motion.device)
+        else:
+            mean_t, std_t = mean, std
+        return motion * std_t + mean_t
+    return motion * std + mean
+
+
+def derive_foot_contact_from_joints(
+    joints: torch.Tensor,
+    height_threshold: float = 0.10,
+    speed_threshold: float = 0.030,
+    locomotion_path_threshold: float = 0.15,
+) -> torch.Tensor:
+    """Recover a [T, 4] binary foot-contact mask from recovered joint xyz.
+
+    HumanML3D's foot_contact channels (cols 259:263 of the 263-dim feature)
+    are binary {0,1} in raw space, but VQ-VAE decode does NOT preserve
+    that binary semantics -- decoded values for those channels saturate
+    above 1.0 and are useless for step detection. Joint positions, in
+    contrast, are the primary VQ-VAE target and reconstruct cleanly.
+
+    A foot is "in contact" when its ankle joint is close to the ground AND
+    moving slowly. Thresholds were tuned against VQ-VAE-reconstructed real
+    HumanML3D walks (loose enough to recover most steps after the decoder
+    smooths the trajectory, tight enough to avoid false steps from in-place
+    actions like clapping or waving).
+
+    To avoid false-positive steps on non-locomotion clips, we also require
+    the clip's total root XZ displacement to exceed `locomotion_path_threshold`.
+    Below that, the body isn't actually moving and any "steps" picked up by
+    the rising-edge detector would be hallucinated from joint jitter.
+
+    Output is laid out [left_heel, left_toe, right_heel, right_toe] like
+    the original channels, so downstream code (move_state / hybrid step
+    detectors, foot-skating score, phase analyzer) works unchanged.
+    """
+    T = int(joints.shape[0])
+    if T < 2:
+        return torch.zeros(T, 4, device=joints.device, dtype=joints.dtype)
+
+    # Locomotion gate: if root barely moves, return all-contact (no steps).
+    root_xz = joints[:, 0, [0, 2]]
+    root_path = torch.norm(root_xz[1:] - root_xz[:-1], dim=-1).sum().item()
+    if root_path < locomotion_path_threshold:
+        return torch.ones(T, 4, device=joints.device, dtype=joints.dtype)
+
+    # ankle indices: 7=l_ankle, 8=r_ankle (more stable than foot joints 10/11
+    # across VQ-VAE reconstructions).
+    l_ankle = joints[:, 7]
+    r_ankle = joints[:, 8]
+
+    # Ground reference: 5th percentile of either ankle's y over the clip.
+    y_pool = torch.cat([l_ankle[:, 1], r_ankle[:, 1]])
+    ground_y = torch.quantile(y_pool, 0.05)
+
+    def _contact_mask(joint_pos):
+        height = joint_pos[:, 1] - ground_y
+        delta_xz = joint_pos[1:, [0, 2]] - joint_pos[:-1, [0, 2]]
+        speed = torch.norm(delta_xz, dim=-1)
+        speed = torch.cat([speed.new_zeros(1), speed])
+        return ((height < height_threshold) & (speed < speed_threshold)).float()
+
+    l_contact = _contact_mask(l_ankle)
+    r_contact = _contact_mask(r_ankle)
+    # Heel + toe channels duplicate the per-foot mask so downstream code
+    # expecting [lh, lt, rh, rt] sees consistent binary signals.
+    return torch.stack([l_contact, l_contact, r_contact, r_contact], dim=-1)
+
 
 def _count_steps_in_range(
     foot_contact: torch.Tensor,
@@ -448,48 +627,66 @@ def _smoothness_score(motion: torch.Tensor) -> float:
 
 
 def _stillness_score(joint_pos: torch.Tensor, min_displacement: float = 0.3) -> float:
-    """Return 0.0 if motion is still, 1.0 if moving enough.
+    """Return 0.0 if motion is broken (frozen / drift / implausibly fast),
+    1.0 if it is plausible animated motion.
 
-    Uses root-relative joint velocity to detect frozen motion.  This is
-    immune to root drift (where repeated identical tokens cause the root
-    to slide at constant velocity, faking movement).
+    Rejects two failure modes:
+      (a) Frozen / drift: body never articulates, root either doesn't move
+          or only slides at a single constant velocity (typical of MEAN-
+          driven decode of zeros or repeated VQ tokens).
+      (b) Random noise: per-frame body-relative joint speeds far exceed any
+          plausible human value (real walks peak ~0.03 m/frame; Gaussian
+          noise easily hits 0.3+). Without this clamp, cumulative directional
+          displacement signals leak high reward to gibberish motion.
+
+    The score is `(in-bounds activity) * (physical plausibility)` so a
+    motion that articulates believably AND moves the root coherently
+    scores ~1.0; frozen, drift, or jittery garbage scores ~0.
 
     Args:
-        joint_pos: [T, 22, 3] 3D joint positions
-        min_displacement: minimum root XZ path length (meters) to count as "moving"
-
-    Returns:
-        Score in [0, 1]. 0 = completely still, 1 = moving enough.
+        joint_pos: [T, 22, 3] joint positions, world frame
+        min_displacement: root XZ path threshold for locomotion path
     """
     T = joint_pos.shape[0]
     if T < 2:
         return 0.0
 
-    # --- Root-relative joint velocity (immune to root drift) ---
-    # Subtract root position so constant-velocity drift cancels out.
-    rel_pos = joint_pos[:, 1:] - joint_pos[:, 0:1]  # [T, 21, 3]
+    # --- Root-relative joint velocity (in-place articulation) ---
+    rel_pos = joint_pos[:, 1:] - joint_pos[:, 0:1]
     rel_vel = torch.norm(rel_pos[1:] - rel_pos[:-1], dim=-1)  # [T-1, 21]
     mean_rel_speed = rel_vel.mean().item()
-    # Real motion: ~0.02 m/frame; frozen/repeated tokens: ~0.00001
-    rel_score = float(np.clip(mean_rel_speed / 0.005, 0.0, 1.0))
+    # HumanML3D real walks have mean_rel_speed ~0.001-0.005; frozen ~1e-5.
+    rel_score = float(np.clip(mean_rel_speed / 0.0005, 0.0, 1.0))
 
-    # --- Joint velocity variance (catches constant-speed drift) ---
-    # Frozen motion has near-zero variance even if mean speed is nonzero.
-    joint_vel = torch.norm(joint_pos[1:] - joint_pos[:-1], dim=-1)  # [T-1, 22]
+    # --- Joint velocity variance (anti constant-speed drift) ---
+    joint_vel = torch.norm(joint_pos[1:] - joint_pos[:-1], dim=-1)
     vel_std = joint_vel.std().item()
-    # Real motion: std ~0.03; frozen: std ~0.00001
-    var_score = float(np.clip(vel_std / 0.005, 0.0, 1.0))
+    var_score = float(np.clip(vel_std / 0.001, 0.0, 1.0))
 
-    # --- Root displacement (for locomotion) ---
+    # --- Root displacement (locomotion) ---
     root_xz = joint_pos[:, 0, [0, 2]]
-    total_path = torch.norm(root_xz[1:] - root_xz[:-1], dim=-1).sum().item()
-    root_score = float(np.clip(total_path / min_displacement, 0.0, 1.0))
+    root_vel = torch.norm(root_xz[1:] - root_xz[:-1], dim=-1)
+    total_path = root_vel.sum().item()
+    root_vel_std = root_vel.std().item()
+    # A real walk has stride-induced root-speed variation (std ~3e-4 to 1e-3
+    # for HumanML3D walks). A constant-velocity drift from MEAN-decoded
+    # zeros has std ~2e-5. Require both meaningful path AND speed variation.
+    root_path_score = float(np.clip(total_path / min_displacement, 0.0, 1.0))
+    root_var_score = float(np.clip(root_vel_std / 0.0002, 0.0, 1.0))
+    root_score = root_path_score * root_var_score
 
-    # Need EITHER meaningful root displacement OR meaningful relative joint motion.
-    # But relative motion must pass - root displacement alone is not enough
-    # (it can be faked by constant root velocity from repeated tokens).
+    # --- Physical plausibility upper bound ---
+    # Real human body-relative joint speed peaks ~0.03 m/frame (sprint).
+    # Gaussian-noise decode produces 0.3+; clearly impossible.
+    max_rel_speed = rel_vel.max().item()
+    if max_rel_speed < 0.10:
+        plausibility = 1.0
+    else:
+        plausibility = max(0.0, 1.0 - (max_rel_speed - 0.10) / 0.20)
+
     body_score = max(rel_score, var_score)
-    return max(body_score * 0.7 + root_score * 0.3, body_score)
+    base = max(body_score, root_score)
+    return float(base * plausibility)
 
 
 # ---------------------------------------------------------------------------
@@ -1276,8 +1473,19 @@ def constraints_to_executor_specs(
     )
 
     for idx, constraint in enumerate(parsed.numerical_constraints):
+        # `constraint.value` may be signed for degrees (CW = negative). Any
+        # geometric quantity derived below uses magnitude only; sign is
+        # carried through `constraint.direction` and the degree scorer.
+        target_mag = abs(float(constraint.value))
         if constraint.type == 'steps':
             if constraint.direction != Direction.ANY:
+                # Displacement thresholds scale with the requested step count.
+                # Roughly 0.5m per step in HumanML3D walks; require ~70% of
+                # that as a lower bound so "stepped slightly forward" doesn't
+                # satisfy "walks 5 steps forward". P1 (audit/reward_real_eval
+                # showed matched vs mismatched on executor was ~50/50 with
+                # the looser thresholds).
+                step_disp_m = max(0.30, 0.35 * target_mag)
                 phase_ref = {
                     "type": "template",
                     "name": "direction_phase",
@@ -1285,9 +1493,12 @@ def constraints_to_executor_specs(
                         "entity": "pelvis",
                         "direction": constraint.direction.value,
                         "frame": "body",
-                        "min_displacement": max(0.12, 0.10 * float(constraint.value)),
+                        "min_displacement": step_disp_m,
                         "min_frames": 6,
-                        "purity_threshold": 0.45,
+                        # Tightened from 0.45: the previous threshold let
+                        # a sample with mostly-forward + slight-lateral
+                        # motion satisfy any of LEFT/RIGHT/FORWARD constraints.
+                        "purity_threshold": 0.60,
                     },
                 }
                 specs.append({
@@ -1300,7 +1511,7 @@ def constraints_to_executor_specs(
                         "args": {"foot": "any"},
                     },
                     "op": "eq",
-                    "value": constraint.value,
+                    "value": target_mag,
                     "tolerance": 0.5,
                     "weight": 1.4,
                 })
@@ -1310,7 +1521,7 @@ def constraints_to_executor_specs(
                     "phase_ref": phase_ref,
                     "measure": "displacement",
                     "op": "ge",
-                    "value": max(0.15, 0.18 * float(constraint.value)),
+                    "value": step_disp_m,
                     "weight": 0.8,
                 })
                 specs.append({
@@ -1327,8 +1538,30 @@ def constraints_to_executor_specs(
                     },
                     "reduce": "last",
                     "op": "ge",
-                    "value": max(0.15, 0.15 * float(constraint.value)),
+                    "value": step_disp_m,
                     "weight": 0.5,
+                })
+                # Purity gate: directional purity must clear 0.6 (i.e. the
+                # body actually went in the requested direction, not just
+                # in roughly that quadrant). Without this, noisy /
+                # shuffled motion can pile up cumulative positive
+                # displacement and game executor_scores.
+                specs.append({
+                    "id": f"{constraint.direction.value}_purity_{idx}",
+                    "kind": "signal",
+                    "ref": {
+                        "type": "signal",
+                        "name": "direction_score",
+                        "args": {
+                            "entity": "pelvis",
+                            "direction": constraint.direction.value,
+                            "frame": "body",
+                        },
+                    },
+                    "reduce": "last",
+                    "op": "ge",
+                    "value": 0.6,
+                    "weight": 0.7,
                 })
             elif not has_temporal_steps:
                 specs.append({
@@ -1340,7 +1573,7 @@ def constraints_to_executor_specs(
                         "args": {"foot": "any"},
                     },
                     "op": "eq",
-                    "value": constraint.value,
+                    "value": target_mag,
                     "tolerance": 1.0,
                     "weight": 1.0,
                 })
@@ -1358,7 +1591,7 @@ def constraints_to_executor_specs(
                 },
                 "reduce": "last",
                 "op": "ge",
-                "value": abs(float(constraint.value)),
+                "value": target_mag,
                 "weight": 1.0,
             })
         elif constraint.type == 'repetitions':
@@ -1372,7 +1605,7 @@ def constraints_to_executor_specs(
                         "args": {},
                     },
                     "op": "eq",
-                    "value": constraint.value,
+                    "value": target_mag,
                     "tolerance": 1.0,
                     "weight": 0.6,
                 })
@@ -1383,6 +1616,9 @@ def constraints_to_executor_specs(
         for idx, direction in enumerate(parsed.direction_sequence):
             if direction == Direction.ANY:
                 continue
+            # Tightened relative to v0: 0.15m displacement was permissive
+            # enough that almost any random walk satisfied it, which let
+            # mismatched captions tie matched on executor_scores.
             phase_ref = {
                 "type": "template",
                 "name": "direction_phase",
@@ -1390,9 +1626,9 @@ def constraints_to_executor_specs(
                     "entity": "pelvis",
                     "direction": direction.value,
                     "frame": "body",
-                    "min_displacement": 0.15,
+                    "min_displacement": 0.30,
                     "min_frames": 6,
-                    "purity_threshold": 0.45,
+                    "purity_threshold": 0.60,
                 },
             }
             specs.append({
@@ -1401,7 +1637,7 @@ def constraints_to_executor_specs(
                 "phase_ref": phase_ref,
                 "measure": "displacement",
                 "op": "ge",
-                "value": 0.15,
+                "value": 0.30,
                 "weight": 0.9,
             })
             specs.append({
@@ -1418,8 +1654,27 @@ def constraints_to_executor_specs(
                 },
                 "reduce": "last",
                 "op": "ge",
-                "value": 0.2,
+                "value": 0.40,
                 "weight": 0.6,
+            })
+            # Purity gate to prevent random jitter from accumulating
+            # positive displacement and satisfying the rule.
+            specs.append({
+                "id": f"dir_purity_{direction.value}_{idx}",
+                "kind": "signal",
+                "ref": {
+                    "type": "signal",
+                    "name": "direction_score",
+                    "args": {
+                        "entity": "pelvis",
+                        "direction": direction.value,
+                        "frame": "body",
+                    },
+                },
+                "reduce": "last",
+                "op": "ge",
+                "value": 0.6,
+                "weight": 0.5,
             })
 
     # Add temporal-composite evidence only for explicit turns.  Plain left/right
@@ -1490,25 +1745,92 @@ def constraints_to_executor_specs(
     return specs
 
 
+def _direction_continuous_fallback(
+    directions: List[Direction],
+    joints: Optional[torch.Tensor],
+) -> float:
+    """Continuous direction-match score from raw root XZ trajectory.
+
+    Used when analyze_motion_phases couldn't isolate clean phases (typical
+    after VQ-VAE reconstruction smooths direction changes below the 35-deg
+    phase split threshold). Returns a dense value in [0, 1].
+
+    Per requested direction d:
+      net_proj   = abs(dot(end_minus_start, d_unit))     # signed
+      directional_path = sum_t |delta_xz_t along d_unit| # path that
+                                                          contributed to the
+                                                          movement on d
+      score_d    = max(0, net_proj_along_d / total_path)
+
+    Using net projection (not cumulative positive) means a random walk that
+    zig-zags forward and back gets a low score, while a real forward walk
+    that mostly went forward gets a high score. Without this, the previous
+    cumulative-positive version inflated every "had any forward motion"
+    sample to ~1.0 and direction bucket lost rank-1 ground.
+
+    Mean over requested directions (multi-direction caption needs all
+    components satisfied).
+    """
+    if joints is None or joints.shape[0] < 2 or not directions:
+        return 0.0
+
+    root_xz = joints[:, 0, [0, 2]]  # [T, 2]
+    delta = root_xz[1:] - root_xz[:-1]
+    path = torch.norm(delta, dim=-1).sum().item()
+    if path < 0.05:
+        return 0.0
+    net_xz = (root_xz[-1] - root_xz[0])  # [2]
+
+    initial_facing = float(np.pi / 2)
+    per_dir = []
+    for d in directions:
+        if d == Direction.ANY or d not in _IDEAL_RELATIVE_ANGLE:
+            continue
+        ideal_angle = initial_facing + _IDEAL_RELATIVE_ANGLE[d]
+        ux = float(np.cos(ideal_angle))
+        uz = float(np.sin(ideal_angle))
+        unit = net_xz.new_tensor([ux, uz])
+        net_proj = float((net_xz * unit).sum().item())
+        # Only positive net projection along the requested direction counts.
+        # Normalize by total path to penalize fidgeting / detours.
+        score_d = max(0.0, net_proj) / max(path, 1e-6)
+        per_dir.append(min(1.0, score_d))
+
+    if not per_dir:
+        return 0.0
+    return float(min(1.0, sum(per_dir) / len(per_dir)))
+
+
 def score_direction_sequence(
     directions: List[Direction],
     phases: List[MotionPhase],
+    joints: Optional[torch.Tensor] = None,
 ) -> float:
     """Score how well motion phases match the expected direction sequence.
 
-    Uses greedy sequential matching: for each expected direction, find the
-    next phase (in order) that matches. Score = fraction matched, with:
-      - a bonus for correct ordering of the first direction
-      - a penalty for redundant extra phases (prevents fidgeting/extra moves)
+    Two-mode scoring:
+      1. PHASE MODE -- when analyze_motion_phases returned at least one
+         significant phase with a non-ANY direction: do greedy sequential
+         matching against `phases`, with first-direction bonus and
+         redundancy penalty. Same as before.
+      2. CONTINUOUS FALLBACK -- when phases are empty (VQ-VAE decoding can
+         smooth direction changes below the 35-degree threshold the phase
+         analyzer uses), fall back to a dense ratio computed directly from
+         root XZ trajectory: average over requested directions of
+         (positive projection onto that direction) / (total path length).
+         Returns a value in [0, 1] that varies smoothly with motion quality
+         instead of collapsing to 0 like the old phase-only path.
 
-    Returns score in [0, 1].
+    The continuous fallback was added after audit/reward_group_eval.py
+    showed direction-only bucket at chance (25% rank-1) because most
+    GT motion phases didn't survive VQ-VAE reconstruction.
     """
     if not directions:
         return 0.0  # no directions to match
 
     sig_phases = [p for p in phases if p.direction != Direction.ANY and p.displacement > 0.05]
     if not sig_phases:
-        return 0.0  # no significant phases - let physical_scores handle stillness
+        return _direction_continuous_fallback(directions, joints)
 
     matched = 0
     last_ph = -1
@@ -1562,6 +1884,40 @@ def _step_accuracy(generated: float, target: float) -> float:
     return float(np.exp(-0.5 * (diff / sigma) ** 2))
 
 
+def _acc_in_range(generated: float, c: 'ConstraintPhase',
+                  sigma_floor: float, sigma_scale: float = 0.2) -> float:
+    """Score `generated` against a constraint that may carry a range.
+
+    Inside [value_min, value_max]: acc = 1.0 (full credit).
+    Outside: Gaussian decay from the nearest range edge.
+    Falls back to a single-point Gaussian around `value` when the range
+    is not populated (precise caption like "3 steps").
+    """
+    if c.value_min is not None and c.value_max is not None:
+        lo, hi = c.value_min, c.value_max
+        if lo <= generated <= hi:
+            return 1.0
+        d = (lo - generated) if generated < lo else (generated - hi)
+        sigma = max(abs(c.value) * sigma_scale, sigma_floor)
+        return float(np.exp(-0.5 * (d / sigma) ** 2))
+    sigma = max(abs(c.value) * sigma_scale, sigma_floor)
+    return float(np.exp(-0.5 * ((generated - c.value) / sigma) ** 2))
+
+
+def _step_accuracy_with_range(generated: float, c: 'ConstraintPhase') -> float:
+    """Range-aware step accuracy. Inside [min,max] = 1.0, outside uses the
+    same asymmetric Gaussian as `_step_accuracy` from the nearest edge."""
+    if c.value_min is not None and c.value_max is not None:
+        if c.value_min <= generated <= c.value_max:
+            return 1.0
+        if generated < c.value_min:
+            edge = c.value_min
+        else:
+            edge = c.value_max
+        return _step_accuracy(generated, edge)
+    return _step_accuracy(generated, c.value)
+
+
 def score_constraints_against_phases(
     constraints: List[ConstraintPhase],
     phases: List[MotionPhase],
@@ -1609,7 +1965,7 @@ def _score_global(
                 generated = dir_steps if dir_steps > 0 else total_steps
             else:
                 generated = total_steps
-            acc = _step_accuracy(generated, c.value)
+            acc = _step_accuracy_with_range(generated, c)
             # Direction match is a multiplicative gate, not an additive bonus.
             # Wrong direction caps accuracy at 0.7; correct direction preserves it.
             if c.direction != Direction.ANY:
@@ -1628,19 +1984,23 @@ def _score_global(
             scores.append(acc)
 
         elif c.type == 'degrees':
+            # Sign convention (empirically verified on HumanML3D):
+            # total_rotation_deg > 0 -> clockwise / right turn.
+            # total_rotation_deg < 0 -> counter-clockwise / left turn.
             if c.direction == Direction.LEFT:
-                generated = total_rotation_deg  # positive = left
+                generated = -total_rotation_deg  # flip so left turns score positive
             elif c.direction == Direction.RIGHT:
-                generated = -total_rotation_deg  # flip sign for right
+                generated = total_rotation_deg   # CW already positive
+            elif c.value < 0:
+                # Caption named a spin direction; c.value already signed.
+                generated = total_rotation_deg
             else:
                 generated = abs(total_rotation_deg)
-            sigma = max(c.value * 0.2, 15.0)
-            acc = np.exp(-0.5 * ((generated - c.value) / sigma) ** 2)
+            acc = _acc_in_range(generated, c, sigma_floor=15.0, sigma_scale=0.2)
             scores.append(acc)
 
         elif c.type == 'repetitions':
-            sigma = max(c.value * 0.3, 1.0)
-            acc = np.exp(-0.5 * ((total_repetitions - c.value) / sigma) ** 2)
+            acc = _acc_in_range(total_repetitions, c, sigma_floor=1.0, sigma_scale=0.3)
             scores.append(acc)
 
     return min(1.0, float(np.mean(scores))) if scores else 0.0
@@ -1708,7 +2068,7 @@ def _score_temporal(
                     generated = dir_steps if dir_steps > 0 else pg_steps
                 else:
                     generated = pg_steps
-                acc = _step_accuracy(generated, c.value)
+                acc = _step_accuracy_with_range(generated, c)
                 if c.direction != Direction.ANY:
                     temporal_dir_total += 1
                     matching = [p for p in pg if p.direction == c.direction]
@@ -1727,19 +2087,20 @@ def _score_temporal(
                 group_scores.append(acc)
 
             elif c.type == 'degrees':
+                # Same empirical sign convention as _score_global.
                 if c.direction == Direction.LEFT:
-                    generated = pg_rotation
-                elif c.direction == Direction.RIGHT:
                     generated = -pg_rotation
+                elif c.direction == Direction.RIGHT:
+                    generated = pg_rotation
+                elif c.value < 0:
+                    generated = pg_rotation
                 else:
                     generated = abs(pg_rotation)
-                sigma = max(c.value * 0.2, 15.0)
-                acc = np.exp(-0.5 * ((generated - c.value) / sigma) ** 2)
+                acc = _acc_in_range(generated, c, sigma_floor=15.0, sigma_scale=0.2)
                 group_scores.append(acc)
 
             elif c.type == 'repetitions':
-                sigma = max(c.value * 0.3, 1.0)
-                acc = np.exp(-0.5 * ((pg_reps - c.value) / sigma) ** 2)
+                acc = _acc_in_range(pg_reps, c, sigma_floor=1.0, sigma_scale=0.3)
                 group_scores.append(acc)
 
     base_score = float(np.mean(group_scores)) if group_scores else 0.0
@@ -1824,8 +2185,11 @@ class GRPORewardModel:
         self._reward_stats = {}
 
     def _denormalize(self, motion: torch.Tensor) -> torch.Tensor:
-        """Denormalize motion from VQ-VAE output space to original space."""
-        return motion * self._std + self._mean
+        """Denormalize motion from VQ-VAE output space to original space.
+
+        See `denormalize_motion` for why we strip the root-velocity MEAN bias.
+        """
+        return denormalize_motion(motion, self._mean, self._std)
 
     def _is_motion_caption(self, caption: str) -> bool:
         """Use Gemma-2 to judge whether caption describes physical movement.
@@ -2129,15 +2493,14 @@ class GRPORewardModel:
             motion_norm = motions[i, :length]  # [T, 263]
             motion_raw = self._denormalize(motion_norm)
 
-            # -- Physical plausibility (simplified: stillness only) --
-            # Foot contact is binary {0,1} in normalized space; denormalization
-            # maps it to ~0.85 which breaks thresholding.  Read from normalized.
-            foot_contact = (motion_norm[:, 259:263] > 0.5).float()
-
-            # Recover 3D joint positions
+            # Recover 3D joint positions first; foot_contact is derived from
+            # joints (the foot_contact channels 259:263 are unreliable when
+            # the motion comes from VQ-VAE decode -- the decoder doesn't
+            # preserve their binary {0,1} semantics).
             joint_pos = recover_from_ric(
                 motion_raw.unsqueeze(0), joints_num=22
             ).squeeze(0)  # [T, 22, 3]
+            foot_contact = derive_foot_contact_from_joints(joint_pos)
 
             # Stillness penalty: if caption describes motion but body is still,
             # apply a smooth penalty. Linear mapping: stillness 0->-1, 1->+1.
@@ -2202,7 +2565,12 @@ class GRPORewardModel:
                 # Only use direction reward when numerical is absent,
                 # to avoid double-counting (numerical already checks direction)
                 has_direction[i] = 1.0
-                direction_scores[i] = score_direction_sequence(dir_seq, phases)
+                # Pass joint_pos so score_direction_sequence can fall back to
+                # the dense projection-ratio score when phase analyzer yields
+                # no clean phases (common after VQ-VAE decode smoothing).
+                direction_scores[i] = score_direction_sequence(
+                    dir_seq, phases, joints=joint_pos,
+                )
 
             # -- Kinematic reward (spatiotemporal) --
             # Convert constraints -> SubGoals via smart adapter, then
@@ -2225,24 +2593,56 @@ class GRPORewardModel:
         cos_sim = (text_norm * motion_norm).sum(dim=-1)  # [B] in [-1, 1]
         cos_sim_01 = (cos_sim + 1.0) / 2.0  # shift to [0, 1]
 
-        # Base reward: cosine similarity (dense, all samples)
-        # Downweight cosine to prevent it from dominating - it's too coarse
-        # to distinguish "2 steps" from "6 steps" in embedding space.
-        kinematic_w = 0.3 * self.numerical_weight
-        numerical_w = self.numerical_weight - kinematic_w
-        cos_weight = 0.5  # reduced from implicit 1.0
-        direction_w = 0.4  # direction matching for captions without numbers
-        executor_w = 0.6 * self.numerical_weight
+        # Unified reward composition (P0.B):
+        #
+        # Real-data audit (audit/reward_real_eval.py) showed the previous
+        # additive composition gave structurally different reward ceilings
+        # depending on which caption bucket a sample fell into -- numeric
+        # captions had a higher max but their numerical/executor branches
+        # were crippled by VQ-VAE foot_contact distortion, so direction-only
+        # caption + wrong motion would routinely outscore numeric caption +
+        # right motion. Result: matched > mismatched only 57% of the time.
+        #
+        # Fix: collapse caption-dependent signals into a single
+        # "caption_satisfaction" score in [0,1] that's always defined, then
+        # combine it with caption-agnostic signals (matching, physical) with
+        # fixed weights. Every caption now has the same reward ceiling.
+        #
+        #   reward = w_match * cos_sim_01            # always active, [0,1]
+        #          + w_phys  * physical_scores        # always active, [0,1]
+        #          + w_cap   * caption_satisfaction   # always active, [0,1]
+        #          - length_penalty
+        #
+        # caption_satisfaction is composed from numerical/direction/executor/
+        # kinematic depending on which signals the caption asks for. When
+        # the caption is "pure" (no parseable cues) it falls back to the
+        # matching-score itself so the model still gets a learning signal.
+        caption_sat = self._compose_caption_satisfaction(
+            numerical_scores=numerical_scores,
+            executor_scores=executor_scores,
+            kinematic_scores=kinematic_scores,
+            direction_scores=direction_scores,
+            has_numerical=has_numerical,
+            has_direction=has_direction,
+            has_executor=has_executor,
+            has_kinematic=has_kinematic,
+            cos_sim_01=cos_sim_01,
+        )
+
+        # Weights chosen so matching (the only consistently reliable signal
+        # in the real-data audit, 74% matched-vs-mismatched on its own)
+        # dominates, but caption-specific evidence can still push the reward
+        # up another ~0.5. Physical scores act as a sanity floor.
+        w_match = 1.0
+        w_phys = self.physical_weight  # default 0.5
+        w_cap = self.numerical_weight  # default 1.0
         length_frac = motion_lengths.float() / motion_lengths.float().clamp(min=1).max()
         length_penalty = self.length_penalty_weight * length_frac
 
         rewards = (
-            cos_weight * cos_sim_01
-            + self.physical_weight * physical_scores
-            + numerical_w * numerical_scores * has_numerical
-            + kinematic_w * kinematic_scores * has_kinematic
-            + direction_w * direction_scores * has_direction
-            + executor_w * executor_scores * has_executor
+            w_match * cos_sim_01
+            + w_phys * physical_scores
+            + w_cap * caption_sat
             - length_penalty
         )
 
@@ -2401,6 +2801,59 @@ class GRPORewardModel:
 
         sent_lens = torch.tensor(sent_lens, device=self.device)
         return word_embeddings, pos_one_hots, sent_lens
+
+    def _compose_caption_satisfaction(
+        self,
+        numerical_scores: torch.Tensor,
+        executor_scores: torch.Tensor,
+        kinematic_scores: torch.Tensor,
+        direction_scores: torch.Tensor,
+        has_numerical: torch.Tensor,
+        has_direction: torch.Tensor,
+        has_executor: torch.Tensor,
+        has_kinematic: torch.Tensor,
+        cos_sim_01: torch.Tensor,
+    ) -> torch.Tensor:
+        """Collapse caption-aware reward branches into one [0,1] score.
+
+        Composition rules (tuned against audit/reward_group_eval.py at K=4):
+          numeric caption:
+              0.55 * numerical_scores
+            + 0.15 * executor_scores  (when has_executor)
+            + 0.05 * kinematic_scores (when has_kinematic)
+            + 0.25 * cos_sim_01
+              -> rank-1 ~63% on numeric bucket; numerical signal carries.
+          direction-only caption:
+              cos_sim_01 only
+              -> empirically the "geometric" direction/executor specs are
+                 active negative signal on this bucket: the audit showed
+                 full reward at 25% rank-1 vs matching-only at 45%. The
+                 evaluator's cosine already encodes caption-motion semantic
+                 match including directional cues, and our geometric specs
+                 reward any forward walk regardless of which caption-bound
+                 direction was requested. Until those specs can actually
+                 distinguish "walks left" from "walks forward" reliably,
+                 deferring to matching alone is the better trade.
+          pure caption:
+              cos_sim_01  -- the only signal available.
+        """
+        B = numerical_scores.shape[0]
+        sat = torch.zeros(B, device=numerical_scores.device,
+                          dtype=numerical_scores.dtype)
+        for i in range(B):
+            has_num = bool(has_numerical[i].item() > 0)
+            c = float(cos_sim_01[i].item())
+            if has_num:
+                n = float(numerical_scores[i].item())
+                has_exec = bool(has_executor[i].item() > 0)
+                has_kin = bool(has_kinematic[i].item() > 0)
+                e = float(executor_scores[i].item()) if has_exec else 0.0
+                k = float(kinematic_scores[i].item()) if has_kin else 0.0
+                sat[i] = 0.55 * n + 0.15 * e + 0.05 * k + 0.25 * c
+            else:
+                # direction_only and pure both fall back to matching.
+                sat[i] = c
+        return sat.clamp(0.0, 1.0)
 
     def _compute_matching_score(
         self,

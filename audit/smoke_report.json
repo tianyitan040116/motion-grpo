@@ -1,0 +1,249 @@
+{
+  "n_captions_evaluated": 100,
+  "aggregates": {
+    "gt": {
+      "mean": 1.0001439143340405,
+      "median": 1.0,
+      "n": 100
+    },
+    "shuffle": {
+      "mean": 0.008141684475475001,
+      "median": 0.0,
+      "n": 100
+    },
+    "noise": {
+      "mean": 0.0,
+      "median": 0.0,
+      "n": 100
+    },
+    "static": {
+      "mean": 0.0,
+      "median": 0.0,
+      "n": 100
+    }
+  },
+  "winner_counts": {
+    "gt": 100,
+    "shuffle": 0,
+    "noise": 0,
+    "static": 0
+  },
+  "n_nan": 0,
+  "rows_first_5": [
+    {
+      "id": "M010137",
+      "caption": "someone with their arms to their side walks one step front-left before stopping.",
+      "T": 62,
+      "variants": {
+        "gt": {
+          "stillness": 1.0,
+          "motion_alive": true,
+          "numerical": 0.5605161820417656,
+          "direction": 0.0,
+          "executor": 0.8688435532375444,
+          "n_constraints": 1,
+          "n_phases": 5
+        },
+        "shuffle": {
+          "stillness": 0.505652442574501,
+          "motion_alive": true,
+          "numerical": 0.0002348238395317583,
+          "direction": 0.0,
+          "executor": 0.8139336237079684,
+          "n_constraints": 1,
+          "n_phases": 5
+        },
+        "noise": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 5
+        },
+        "static": {
+          "stillness": 0.0029131153951311717,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 1
+        }
+      }
+    },
+    {
+      "id": "002981",
+      "caption": "a man walks forward in a circle before stopping.",
+      "T": 149,
+      "variants": {
+        "gt": {
+          "stillness": 0.7849460244178772,
+          "motion_alive": true,
+          "numerical": 1.0,
+          "direction": 0.0,
+          "executor": 1.184119245738156e-155,
+          "n_constraints": 1,
+          "n_phases": 3
+        },
+        "shuffle": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 2
+        },
+        "noise": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 16
+        },
+        "static": {
+          "stillness": 0.0029134739634173457,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 1
+        }
+      }
+    },
+    {
+      "id": "011264",
+      "caption": "a person pauses briefly before taking a few steps forward, then stops and jumps once.",
+      "T": 199,
+      "variants": {
+        "gt": {
+          "stillness": 0.9705270230770111,
+          "motion_alive": true,
+          "numerical": 1.0,
+          "direction": 0.0,
+          "executor": 0.8688435532375444,
+          "n_constraints": 1,
+          "n_phases": 17
+        },
+        "shuffle": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 15
+        },
+        "noise": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 20
+        },
+        "static": {
+          "stillness": 0.0029133759653632296,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 1
+        }
+      }
+    },
+    {
+      "id": "011253",
+      "caption": "a person takes two steps forward and bends over slightly to stroke or pet an object in front of them using their right hand going from right to left.",
+      "T": 199,
+      "variants": {
+        "gt": {
+          "stillness": 0.9010325893759727,
+          "motion_alive": true,
+          "numerical": 0.8007374029168081,
+          "direction": 0.0,
+          "executor": 0.9262669276904684,
+          "n_constraints": 1,
+          "n_phases": 20
+        },
+        "shuffle": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 21
+        },
+        "noise": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 19
+        },
+        "static": {
+          "stillness": 0.0029133759653632296,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 1
+        }
+      }
+    },
+    {
+      "id": "004611",
+      "caption": "figure walks forward 5 steps with arms down by side",
+      "T": 145,
+      "variants": {
+        "gt": {
+          "stillness": 0.9798452779650688,
+          "motion_alive": true,
+          "numerical": 0.8493658165683124,
+          "direction": 0.0,
+          "executor": 0.9682791393453197,
+          "n_constraints": 1,
+          "n_phases": 5
+        },
+        "shuffle": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 1
+        },
+        "noise": {
+          "stillness": 0.0,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 13
+        },
+        "static": {
+          "stillness": 0.002913246817115578,
+          "motion_alive": false,
+          "numerical": 0.0,
+          "direction": 0.0,
+          "executor": 0.0,
+          "n_constraints": 1,
+          "n_phases": 1
+        }
+      }
+    }
+  ]
+}

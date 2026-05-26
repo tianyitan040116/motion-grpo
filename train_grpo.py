@@ -176,6 +176,8 @@ def get_grpo_args():
     # Validation
     parser.add_argument('--epochs-start-val', type=int, default=2, help='start validation after N epochs')
     parser.add_argument('--epochs-val-interval', type=int, default=2, help='validation interval')
+    parser.add_argument('--checkpoint-every-batches', type=int, default=25,
+                        help='persist trainer state every N batches for resume')
 
     # LLM parameters (from original train script)
     parser.add_argument('--llm-backbone', type=str, default=_DEFAULT_LLM_BACKBONE)
@@ -201,6 +203,20 @@ def get_grpo_args():
     parser.add_argument("--quantizer", type=str, default='ema_reset')
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--vq-path', type=str, default="ckpt/vqvae.pth")
+
+    # Prompt mix (P1): re-balance HumanML3D so numeric/direction captions are
+    # over-sampled relative to their natural frequency. Default off; opt in
+    # with --prompt-mix to use it.
+    parser.add_argument('--prompt-mix', action='store_true',
+                        help='use bucketed numeric/direction/pure mix instead of uniform sampling')
+    parser.add_argument('--mix-numeric', type=float, default=0.30,
+                        help='fraction of batches drawn from numeric-constraint captions')
+    parser.add_argument('--mix-direction', type=float, default=0.40,
+                        help='fraction of batches drawn from direction-only captions')
+    parser.add_argument('--mix-pure', type=float, default=0.30,
+                        help='fraction of batches drawn from pure (no parseable cues) captions')
+    parser.add_argument('--mix-seed', type=int, default=0,
+                        help='seed for prompt-mix sampling rng')
 
     # Output
     parser.add_argument('--out-dir', type=str, default='experiments_grpo')
@@ -585,6 +601,21 @@ class GRPOTrainer:
         batch_size = len(captions)
         G = self.args.num_samples_per_prompt
 
+        # Periodically check the realised bucket mix when prompt_mix is on.
+        # Cheap to compute (a regex parse per caption every ~50 batches).
+        if getattr(self.args, "prompt_mix", False) and self.global_step % 50 == 0:
+            try:
+                from dataset.prompt_mix import classify_caption
+                from collections import Counter
+                bc = Counter(classify_caption(c) for c in captions)
+                self.logger.info(
+                    f"[mix_check step={self.global_step}] "
+                    + " ".join(f"{k}={bc.get(k,0)}" for k in
+                               ("numeric", "direction_only", "pure"))
+                )
+            except Exception as e:
+                self.logger.debug(f"mix_check failed: {e}")
+
         # Step 1: Group sampling
         self.logger.debug(f"Sampling {G} motions per caption...")
         sampled_motions_all = self.group_sample(captions, G)
@@ -786,11 +817,25 @@ class GRPOTrainer:
                 f"Kin: {metrics.get('kinematic', 0):.4f}, Exec: {metrics.get('executor', 0):.4f}"
             )
 
-            # Save checkpoint every 20 batches
-            if (batch_idx + 1) % 20 == 0:
+            # Save checkpoint every 25 batches (configurable via
+            # --checkpoint-every-batches if you want a different cadence).
+            if (batch_idx + 1) % int(getattr(self.args, 'checkpoint_every_batches', 25)) == 0:
                 state_path = os.path.join(self.args.out_dir, 'grpo_state.pth')
                 self.save_state(state_path, epoch, batch_idx + 1, best_reward=best_reward)
                 self.logger.info(f"[CHECKPOINT] Saved at Epoch {epoch} Batch {batch_idx+1}")
+
+            # Track running best by per-batch reward and save immediately.
+            # The end-of-epoch loop also rechecks, so this gives us a
+            # finer-grained "best so far" image even mid-epoch.
+            current_reward = float(metrics.get('reward', 0.0))
+            if current_reward > best_reward:
+                best_reward = current_reward
+                best_path = os.path.join(self.args.out_dir, 'motionllm_grpo_best.pth')
+                self.model.save_model(best_path)
+                self.logger.info(
+                    f"[BEST] Reward {best_reward:.4f} at Epoch {epoch} Batch {batch_idx+1}; "
+                    f"saved {best_path}"
+                )
 
             if self.args.max_train_batches > 0 and processed_batches >= self.args.max_train_batches:
                 self.logger.info(
@@ -806,6 +851,9 @@ class GRPOTrainer:
         }
         avg_metrics['last_batch_idx'] = last_batch_idx
         avg_metrics['processed_batches'] = processed_batches
+        # Surface running best updated inside the batch loop so the main
+        # training loop can persist it across epochs.
+        avg_metrics['best_reward'] = best_reward
         return avg_metrics
 
     def save_state(self, path, epoch, next_batch_idx, best_reward=-float('inf')):
@@ -910,13 +958,30 @@ def main():
 
     # Step 4: Load datasets
     logger.info("\n[4/5] Loading datasets...")
-    train_loader = dataset_TM_eval.DATALoader(
-        args.dataname,
-        "train",
-        args.batch_size,
-        w_vectorizer,
-        unit_length=2**args.down_t
-    )
+    if args.prompt_mix:
+        from dataset.prompt_mix import build_mixed_loader, MixConfig
+        mix_cfg = MixConfig(
+            numeric=args.mix_numeric,
+            direction=args.mix_direction,
+            pure=args.mix_pure,
+        )
+        logger.info(
+            f"[prompt_mix] enabled  numeric={mix_cfg.numeric:.0%}  "
+            f"direction={mix_cfg.direction:.0%}  pure={mix_cfg.pure:.0%}  "
+            f"seed={args.mix_seed}"
+        )
+        train_loader = build_mixed_loader(
+            args.dataname, "train", args.batch_size, w_vectorizer,
+            config=mix_cfg, unit_length=2**args.down_t, seed=args.mix_seed,
+        )
+    else:
+        train_loader = dataset_TM_eval.DATALoader(
+            args.dataname,
+            "train",
+            args.batch_size,
+            w_vectorizer,
+            unit_length=2**args.down_t
+        )
     val_loader = dataset_TM_eval.DATALoader(
         args.dataname,
         "val",
@@ -987,6 +1052,8 @@ def main():
         # Train for one epoch (resume from start_batch for first epoch only)
         epoch_start_batch = start_batch if epoch == start_epoch else 0
         epoch_metrics = trainer.train_epoch(train_loader, epoch, start_batch_idx=epoch_start_batch, best_reward=best_reward)
+        # Carry the running best across epochs.
+        best_reward = max(best_reward, float(epoch_metrics.get('best_reward', best_reward)))
 
         # Log epoch summary
         logger.info(
@@ -999,7 +1066,8 @@ def main():
             f"Ratio: {epoch_metrics['ratio']:.3f}, "
             f"ClipFrac: {epoch_metrics['clip_fraction']:.3f}, "
             f"InnerK: {epoch_metrics['inner_steps_used']:.1f}, "
-            f"ProcessedBatches: {int(epoch_metrics.get('processed_batches', 0))}"
+            f"ProcessedBatches: {int(epoch_metrics.get('processed_batches', 0))}, "
+            f"BestReward: {best_reward:.4f}"
         )
 
         # Save latest checkpoint (both model and full state for resume)
@@ -1014,7 +1082,21 @@ def main():
         )
         logger.info(f"[OK] Epoch checkpoint saved to {checkpoint_path}")
 
-        # Validation
+        # End-of-epoch best check (also catches the case where the running
+        # best inside train_epoch missed -- e.g. epoch mean is higher than
+        # any single batch peak for whatever reason).
+        if epoch_metrics['reward'] > best_reward:
+            best_reward = float(epoch_metrics['reward'])
+            best_path = os.path.join(args.out_dir, 'motionllm_grpo_best.pth')
+            model.save_model(best_path)
+            logger.info(
+                f"[BEST] Epoch-avg reward {best_reward:.4f} beats running best; "
+                f"saved {best_path}"
+            )
+
+        # Validation every epoch by default (set --epochs-start-val higher
+        # to skip the first few). Lets us check FID / matching / Top-K
+        # drift right after each epoch's worth of GRPO updates.
         if epoch >= args.epochs_start_val and (epoch + 1) % args.epochs_val_interval == 0:
             logger.info("\nRunning validation...")
             model.eval()
@@ -1033,13 +1115,6 @@ def main():
                 f"Top1: {top1:.4f}, Top2: {top2:.4f}, Top3: {top3:.4f}, "
                 f"Matching: {matching:.4f}, Multi: {multi:.4f}"
             )
-
-            # Save best model based on reward (or matching score)
-            if epoch_metrics['reward'] > best_reward:
-                best_reward = epoch_metrics['reward']
-                best_path = os.path.join(args.out_dir, 'motionllm_grpo_best.pth')
-                model.save_model(best_path)
-                logger.info(f"[OK] Best model saved! Reward: {best_reward:.4f}")
 
     logger.info("\n" + "="*60)
     logger.info("GRPO Training Completed!")

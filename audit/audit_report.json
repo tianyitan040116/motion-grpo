@@ -1,0 +1,919 @@
+{
+  "B_detector": {
+    "candidates": 7880,
+    "sampled": 500,
+    "step_summary": {
+      "n": 149,
+      "mean": 2.6308724832214767,
+      "median": 1.0,
+      "abs_mean": 2.7114093959731544,
+      "p90_abs": 9.0,
+      "acc_within_1": 0.5503355704697986
+    },
+    "rotation_summary_excluding_gt_noise": {
+      "n": 22,
+      "mean": -3.587961659332555,
+      "median": -32.578535431330614,
+      "abs_mean": 76.95696272215194,
+      "p90_abs": 127.45283938469733,
+      "acc_within_30": 0.13636363636363635
+    },
+    "degrees_buckets": {
+      "total": 108,
+      "ok_in_range": 39,
+      "sign_flip_gt_data_noise": 21,
+      "under_motion_gt_data_noise": 26,
+      "magnitude_off": 22
+    },
+    "reward_on_gt_summary": {
+      "n": 275,
+      "mean": 0.5749148574212467,
+      "median": 0.7,
+      "p25": 0.1353352832366127,
+      "p75": 1.0,
+      "frac_ge_0.5": 0.5854545454545454,
+      "frac_ge_0.7": 0.5127272727272727
+    },
+    "low_reward_failures_first_20": [
+      {
+        "id": "014449",
+        "caption": "a person jumps up and down twice.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "M002737",
+        "caption": "a man pulls both his arms up to shoulder level then reaches twice towards his head. his arms then return to the side.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "003706",
+        "caption": "a man sprints in place and then makes a circular motion facing 120 degrees as they sprint as if they are trying to hype up an exercise class.",
+        "score": 0.0,
+        "n_constraints": 1
+      },
+      {
+        "id": "003718",
+        "caption": "a man throwing with his right arm in slow motion twice.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "002539",
+        "caption": "a person stands in place raising his arm at the elbow up and down two times.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "M003238",
+        "caption": "a person is jogging in circles",
+        "score": 0.022,
+        "n_constraints": 1
+      },
+      {
+        "id": "M007187",
+        "caption": "a person makes a squatting motion two times.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "M010923",
+        "caption": "a person jumps two times.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "002689",
+        "caption": "a figure drops to its hands and knees, crawls two steps, turns counterclockwise to crawl another two steps, then stands.",
+        "score": 0.0,
+        "n_constraints": 1
+      },
+      {
+        "id": "M012912",
+        "caption": "a person takes one step back with right leg, and then one step forward to original position",
+        "score": 0.095,
+        "n_constraints": 2
+      },
+      {
+        "id": "013265",
+        "caption": "a person moves their left hand in a counter-clockwise horizontal circle",
+        "score": 0.05,
+        "n_constraints": 1
+      },
+      {
+        "id": "001740",
+        "caption": "a person runs to their right for 4 steps, turns around, runs back 5 steps and then walks back to where they began.",
+        "score": 0.206,
+        "n_constraints": 2
+      },
+      {
+        "id": "M013001",
+        "caption": "a man raises his left arm three times while sitting on a chair.",
+        "score": 0.011,
+        "n_constraints": 1
+      },
+      {
+        "id": "000427",
+        "caption": "the person is in a fighting pose with both hands ready to strike, then does a 360 degrees, clockwise kick with their right foot.",
+        "score": 0.0,
+        "n_constraints": 1
+      },
+      {
+        "id": "M003847",
+        "caption": "a man kicks twice with his left leg with the second kick being more forceful.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "007021",
+        "caption": "someone stirs something with their right hand twice and then stops.",
+        "score": 0.135,
+        "n_constraints": 1
+      },
+      {
+        "id": "009520",
+        "caption": "a person walks side to side in a half circle path.",
+        "score": 0.009,
+        "n_constraints": 1
+      },
+      {
+        "id": "006860",
+        "caption": "a person is dancing in a circle while facing forward.",
+        "score": 0.048,
+        "n_constraints": 1
+      },
+      {
+        "id": "002468",
+        "caption": "person takes 2 steps forward, while raising both arms out to the side to shoulder height, then a step back, bringing both arms back in front of the body to chest height",
+        "score": 0.015,
+        "n_constraints": 2
+      },
+      {
+        "id": "M000221",
+        "caption": "a person puts their right hand out in front of them and moves it around in circles.",
+        "score": 0.039,
+        "n_constraints": 1
+      }
+    ],
+    "failures_first_20": {
+      "steps": [
+        {
+          "id": "M009637",
+          "caption": "a person takes a step forward before pivoting on their right foot to make a sharp turn back.",
+          "target": 1.0,
+          "range": [
+            1.0,
+            3.0
+          ],
+          "detected": 6
+        },
+        {
+          "id": "002004",
+          "caption": "a person walks to their left three steps, turns around, walks 5 steps, turns around and walks back to where they started.",
+          "target": 5.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 12
+        },
+        {
+          "id": "002004",
+          "caption": "a person walks to their left three steps, turns around, walks 5 steps, turns around and walks back to where they started.",
+          "target": 3.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 12
+        },
+        {
+          "id": "009662",
+          "caption": "a person steps back, kneels down, crawls forward, stands up and then takes several steps.",
+          "target": 4.0,
+          "range": [
+            3.0,
+            6.0
+          ],
+          "detected": 8
+        },
+        {
+          "id": "M002125",
+          "caption": "person moves steps to their right then a few steps to their left and then a few more steps to their right",
+          "target": 3.0,
+          "range": [
+            2.0,
+            5.0
+          ],
+          "detected": 17
+        },
+        {
+          "id": "002689",
+          "caption": "a figure drops to its hands and knees, crawls two steps, turns counterclockwise to crawl another two steps, then stands.",
+          "target": 2.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 8
+        },
+        {
+          "id": "M012912",
+          "caption": "a person takes one step back with right leg, and then one step forward to original position",
+          "target": 1.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 4
+        },
+        {
+          "id": "M012912",
+          "caption": "a person takes one step back with right leg, and then one step forward to original position",
+          "target": 1.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 4
+        },
+        {
+          "id": "001740",
+          "caption": "a person runs to their right for 4 steps, turns around, runs back 5 steps and then walks back to where they began.",
+          "target": 4.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 13
+        },
+        {
+          "id": "001740",
+          "caption": "a person runs to their right for 4 steps, turns around, runs back 5 steps and then walks back to where they began.",
+          "target": 5.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 13
+        },
+        {
+          "id": "001747",
+          "caption": "person walks backwards for a step then walk towards left and then to left and turns around",
+          "target": 1.0,
+          "range": [
+            1.0,
+            3.0
+          ],
+          "detected": 13
+        },
+        {
+          "id": "005241",
+          "caption": "a person takes 3 steps forward, slows a step, then continues walking forward.",
+          "target": 3.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 6
+        },
+        {
+          "id": "005241",
+          "caption": "a person takes 3 steps forward, slows a step, then continues walking forward.",
+          "target": 1.0,
+          "range": [
+            1.0,
+            3.0
+          ],
+          "detected": 6
+        },
+        {
+          "id": "006305",
+          "caption": "a person who is standing with his arms by his sides takes two steps forward, turns 180 degrees and takes two steps in the other direction and stops.",
+          "target": 2.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 5
+        },
+        {
+          "id": "013422",
+          "caption": "a person assumes a baseball-like throwing action towards the left side of their body, they then stumble in that direction before taking a step towards from where they started.",
+          "target": 1.0,
+          "range": [
+            1.0,
+            3.0
+          ],
+          "detected": 5
+        },
+        {
+          "id": "002468",
+          "caption": "person takes 2 steps forward, while raising both arms out to the side to shoulder height, then a step back, bringing both arms back in front of the body to chest height",
+          "target": 2.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 5
+        },
+        {
+          "id": "002468",
+          "caption": "person takes 2 steps forward, while raising both arms out to the side to shoulder height, then a step back, bringing both arms back in front of the body to chest height",
+          "target": 1.0,
+          "range": [
+            1.0,
+            3.0
+          ],
+          "detected": 5
+        },
+        {
+          "id": "002181",
+          "caption": "a person waltzes in a three step rhythm with their right arm held out in front of them.",
+          "target": 3.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 13
+        },
+        {
+          "id": "002911",
+          "caption": "a person takes two steps forward, picks up something, and then takes two steps backwards.",
+          "target": 2.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 6
+        },
+        {
+          "id": "002911",
+          "caption": "a person takes two steps forward, picks up something, and then takes two steps backwards.",
+          "target": 2.0,
+          "range": [
+            null,
+            null
+          ],
+          "detected": 6
+        }
+      ],
+      "degrees": [
+        {
+          "id": "M003238",
+          "caption": "a person is jogging in circles",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "any",
+          "measured": 739.0,
+          "detected_deg": 739.0
+        },
+        {
+          "id": "009097",
+          "caption": "a person is pushing something counterclockwise in a circle, stops and picks something up and tosses it.",
+          "target": -360.0,
+          "range": [
+            -540.0,
+            -180.0
+          ],
+          "tgt_dir": "any",
+          "measured": -130.8,
+          "detected_deg": -130.8
+        },
+        {
+          "id": "M013533",
+          "caption": "the man meanders around in circles.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "any",
+          "measured": 143.6,
+          "detected_deg": 143.6
+        },
+        {
+          "id": "M004768",
+          "caption": "crawling in a circle then standing.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "any",
+          "measured": 87.3,
+          "detected_deg": 87.3
+        },
+        {
+          "id": "006760",
+          "caption": "a person walks in a circle, placing right foot in the circle.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "right",
+          "measured": 42.7,
+          "detected_deg": 42.7
+        },
+        {
+          "id": "M002501",
+          "caption": "a person lowers their hands and then walks in a circle and then away from the front.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "any",
+          "measured": 167.8,
+          "detected_deg": 167.8
+        },
+        {
+          "id": "M010291",
+          "caption": "person is crawling on hands and knees, they turn around 180 degrees and then stand up",
+          "target": 180.0,
+          "range": [
+            null,
+            null
+          ],
+          "tgt_dir": "any",
+          "measured": 97.1,
+          "detected_deg": 97.1
+        },
+        {
+          "id": "M007092",
+          "caption": "a person walks half a circle counterclockwise, then another half circle clockwise.",
+          "target": -180.0,
+          "range": [
+            -240.0,
+            -120.0
+          ],
+          "tgt_dir": "any",
+          "measured": -103.9,
+          "detected_deg": -103.9
+        },
+        {
+          "id": "001972",
+          "caption": "a person jogs in a left turning pattern and completes two full circles.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "left",
+          "measured": 668.4,
+          "detected_deg": -668.4
+        },
+        {
+          "id": "002698",
+          "caption": "a man walks forwards and turns left in a semicircle.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "left",
+          "measured": 90.2,
+          "detected_deg": -90.2
+        },
+        {
+          "id": "007524",
+          "caption": "a person jogs in a circle to the left.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "left",
+          "measured": 659.1,
+          "detected_deg": -659.1
+        },
+        {
+          "id": "M012650",
+          "caption": "a person lifts both arms from side of waist up, then moves left then right with hip, then turns 70 degrees counterclockwise from viewer and takes 3 steps with right then left foot and stops.",
+          "target": -70.0,
+          "range": [
+            null,
+            null
+          ],
+          "tgt_dir": "right",
+          "measured": -104.7,
+          "detected_deg": -104.7
+        },
+        {
+          "id": "M005253",
+          "caption": "person walks towards screen, then makes half circle to the left and stops.",
+          "target": 180.0,
+          "range": [
+            120.0,
+            240.0
+          ],
+          "tgt_dir": "left",
+          "measured": 99.8,
+          "detected_deg": -99.8
+        },
+        {
+          "id": "013732",
+          "caption": "a person walks in a semi circle to the right.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "right",
+          "measured": 101.8,
+          "detected_deg": 101.8
+        },
+        {
+          "id": "M007477",
+          "caption": "a person walking in a half circle",
+          "target": 180.0,
+          "range": [
+            120.0,
+            240.0
+          ],
+          "tgt_dir": "any",
+          "measured": 77.3,
+          "detected_deg": 77.3
+        },
+        {
+          "id": "000052",
+          "caption": "a person walks to the right in a partial circle.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "right",
+          "measured": 91.0,
+          "detected_deg": 91.0
+        },
+        {
+          "id": "M002373",
+          "caption": "person walks in half circle on platform",
+          "target": 180.0,
+          "range": [
+            120.0,
+            240.0
+          ],
+          "tgt_dir": "any",
+          "measured": 79.9,
+          "detected_deg": 79.9
+        },
+        {
+          "id": "000879",
+          "caption": "person walks with arms to side forward the starts to curve to their left in shape of 1/4 circle.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "left",
+          "measured": 80.6,
+          "detected_deg": -80.6
+        },
+        {
+          "id": "M006261",
+          "caption": "the person is jogging in a circle.",
+          "target": 360.0,
+          "range": [
+            180.0,
+            540.0
+          ],
+          "tgt_dir": "any",
+          "measured": 643.6,
+          "detected_deg": 643.6
+        },
+        {
+          "id": "M007942",
+          "caption": "person is walking in a half circle towards the left",
+          "target": 180.0,
+          "range": [
+            120.0,
+            240.0
+          ],
+          "tgt_dir": "left",
+          "measured": 89.6,
+          "detected_deg": -89.6
+        }
+      ]
+    },
+    "per_sample_first_15": [
+      {
+        "id": "M010735",
+        "caption": "someone standing and takes a step to the left.",
+        "T": 60,
+        "detected_steps": 2,
+        "detected_deg": 7.1,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 1.0,
+            "dir": "left",
+            "range": [
+              1.0,
+              3.0
+            ],
+            "err": 0
+          }
+        ],
+        "reward_score_on_gt": 0.7
+      },
+      {
+        "id": "011418",
+        "caption": "he walks in a circle, clockwise.",
+        "T": 145,
+        "detected_steps": 9,
+        "detected_deg": 356.3,
+        "targets": [
+          {
+            "type": "degrees",
+            "value": 360.0,
+            "dir": "any",
+            "range": [
+              180.0,
+              540.0
+            ],
+            "err": 0.0,
+            "measured": 356.3
+          }
+        ],
+        "reward_score_on_gt": 1.0
+      },
+      {
+        "id": "M008048",
+        "caption": "a person walking in a circle counterclockwise.",
+        "T": 189,
+        "detected_steps": 9,
+        "detected_deg": -334.4,
+        "targets": [
+          {
+            "type": "degrees",
+            "value": -360.0,
+            "dir": "any",
+            "range": [
+              -540.0,
+              -180.0
+            ],
+            "err": 0.0,
+            "measured": -334.4
+          }
+        ],
+        "reward_score_on_gt": 1.0
+      },
+      {
+        "id": "012629",
+        "caption": "the man drops his arms and balances with his arms to take several steps forward.",
+        "T": 125,
+        "detected_steps": 7,
+        "detected_deg": 53.7,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 4.0,
+            "dir": "forward",
+            "range": [
+              3.0,
+              6.0
+            ],
+            "err": 1.0
+          }
+        ],
+        "reward_score_on_gt": 0.625
+      },
+      {
+        "id": "M000857",
+        "caption": "a person takes four steps, left foot first then right foot, moving forward.",
+        "T": 80,
+        "detected_steps": 5,
+        "detected_deg": -8.6,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 4.0,
+            "dir": "left",
+            "range": [
+              null,
+              null
+            ],
+            "err": 1
+          }
+        ],
+        "reward_score_on_gt": 0.7
+      },
+      {
+        "id": "M000152",
+        "caption": "a person walks  5 steps straight ahead and stops.",
+        "T": 103,
+        "detected_steps": 5,
+        "detected_deg": 2.7,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 5.0,
+            "dir": "forward",
+            "range": [
+              null,
+              null
+            ],
+            "err": 0
+          }
+        ],
+        "reward_score_on_gt": 1.0
+      },
+      {
+        "id": "M013086",
+        "caption": "someone making a wiping motion with one hand then moving backwards a few steps and then palcing arms up to suoulder heighth.",
+        "T": 149,
+        "detected_steps": 2,
+        "detected_deg": -31.9,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 3.0,
+            "dir": "backward",
+            "range": [
+              2.0,
+              5.0
+            ],
+            "err": 0
+          }
+        ],
+        "reward_score_on_gt": 0.7
+      },
+      {
+        "id": "M008819",
+        "caption": "person take a step back then sits down then getting back up and stepping forward.",
+        "T": 154,
+        "detected_steps": 4,
+        "detected_deg": -4.3,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 1.0,
+            "dir": "backward",
+            "range": [
+              1.0,
+              3.0
+            ],
+            "err": 1.0
+          }
+        ],
+        "reward_score_on_gt": 0.561
+      },
+      {
+        "id": "008846",
+        "caption": "a person who is standing with his arms by his sides takes four steps backwards.",
+        "T": 105,
+        "detected_steps": 5,
+        "detected_deg": 1.0,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 4.0,
+            "dir": "backward",
+            "range": [
+              null,
+              null
+            ],
+            "err": 1
+          }
+        ],
+        "reward_score_on_gt": 0.801
+      },
+      {
+        "id": "014449",
+        "caption": "a person jumps up and down twice.",
+        "T": 100,
+        "detected_steps": 8,
+        "detected_deg": 7.1,
+        "targets": [
+          {
+            "type": "repetitions",
+            "value": 2.0,
+            "dir": "any",
+            "range": [
+              null,
+              null
+            ]
+          }
+        ],
+        "reward_score_on_gt": 0.135
+      },
+      {
+        "id": "M002737",
+        "caption": "a man pulls both his arms up to shoulder level then reaches twice towards his head. his arms then return to the side.",
+        "T": 199,
+        "detected_steps": 0,
+        "detected_deg": -4.9,
+        "targets": [
+          {
+            "type": "repetitions",
+            "value": 2.0,
+            "dir": "any",
+            "range": [
+              null,
+              null
+            ]
+          }
+        ],
+        "reward_score_on_gt": 0.135
+      },
+      {
+        "id": "M012231",
+        "caption": "the man takes 8 steps in a counterclockwise circle.",
+        "T": 158,
+        "detected_steps": 9,
+        "detected_deg": 327.8,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 8.0,
+            "dir": "any",
+            "range": [
+              null,
+              null
+            ],
+            "err": 1
+          },
+          {
+            "type": "degrees",
+            "value": -360.0,
+            "dir": "any",
+            "range": [
+              -540.0,
+              -180.0
+            ],
+            "err": 507.8,
+            "measured": 327.8
+          }
+        ],
+        "reward_score_on_gt": 0.469
+      },
+      {
+        "id": "M000695",
+        "caption": "a person taking a step backward in a left diagonal direction.",
+        "T": 79,
+        "detected_steps": 2,
+        "detected_deg": 3.2,
+        "targets": [
+          {
+            "type": "steps",
+            "value": 1.0,
+            "dir": "backward",
+            "range": [
+              1.0,
+              3.0
+            ],
+            "err": 0
+          }
+        ],
+        "reward_score_on_gt": 0.7
+      },
+      {
+        "id": "003706",
+        "caption": "a man sprints in place and then makes a circular motion facing 120 degrees as they sprint as if they are trying to hype up an exercise class.",
+        "T": 171,
+        "detected_steps": 48,
+        "detected_deg": -1.2,
+        "targets": [
+          {
+            "type": "degrees",
+            "value": 120.0,
+            "dir": "any",
+            "range": [
+              null,
+              null
+            ],
+            "err": -121.2,
+            "measured": -1.2
+          }
+        ],
+        "reward_score_on_gt": 0.0
+      },
+      {
+        "id": "003718",
+        "caption": "a man throwing with his right arm in slow motion twice.",
+        "T": 199,
+        "detected_steps": 2,
+        "detected_deg": -101.4,
+        "targets": [
+          {
+            "type": "repetitions",
+            "value": 2.0,
+            "dir": "right",
+            "range": [
+              null,
+              null
+            ]
+          }
+        ],
+        "reward_score_on_gt": 0.135
+      }
+    ]
+  }
+}
