@@ -860,6 +860,19 @@ def _required_minimum_energy(
         elif has_bwd and not has_fwd:
             req['signed_forward_m'] = -0.15
 
+    # Baseline articulation floor (post-run2 fix).
+    # run2 plateaued because pure-bucket captions whose verb didn't match
+    # any regex above (e.g., "the man plays guitar", "person writes",
+    # "figure moves around the floor") had req all-zero -> gate = 1.0 even
+    # for fully-static outputs. That gave the policy free reward to drift
+    # toward "produce a plausible-shaped static human pose for ANY
+    # prompt" -- the bias then leaked into walk/back/turn prompts via the
+    # shared LoRA. Forcing a minimal rel_speed (0.001 m/frame, ~bottom of
+    # the real-motion range) keeps the gate sensitive to static outputs
+    # for those long-tail motion captions without false-firing on real GT.
+    if req['rel_speed'] == 0.0:
+        req['rel_speed'] = 0.0010
+
     return req
 
 
