@@ -656,7 +656,10 @@ def _stillness_score(joint_pos: torch.Tensor, min_displacement: float = 0.3) -> 
     rel_vel = torch.norm(rel_pos[1:] - rel_pos[:-1], dim=-1)  # [T-1, 21]
     mean_rel_speed = rel_vel.mean().item()
     # HumanML3D real walks have mean_rel_speed ~0.001-0.005; frozen ~1e-5.
-    rel_score = float(np.clip(mean_rel_speed / 0.0005, 0.0, 1.0))
+    # Saturation point raised from 0.0005 -> 0.002 after run1 collapse: at
+    # 0.0005 any tiny in-place wiggle scored 1.0, letting the model drift
+    # into "stand and twitch" while collecting full physical reward.
+    rel_score = float(np.clip(mean_rel_speed / 0.002, 0.0, 1.0))
 
     # --- Joint velocity variance (anti constant-speed drift) ---
     joint_vel = torch.norm(joint_pos[1:] - joint_pos[:-1], dim=-1)
@@ -687,6 +690,141 @@ def _stillness_score(joint_pos: torch.Tensor, min_displacement: float = 0.3) -> 
     body_score = max(rel_score, var_score)
     base = max(body_score, root_score)
     return float(base * plausibility)
+
+
+# ---------------------------------------------------------------------------
+# Motion-energy gate (P0.C, post-run1 collapse fix)
+#
+# Background: run1 collapsed because for direction-only and pure-caption
+# prompts (70% of the prompt mix) the reward composition fell back to
+# matching-only. Combined with a too-easy stillness saturation, the model
+# learned a "stand still + wiggle" attractor that scored full physical +
+# good matching without doing the requested action.
+#
+# Fix: require that the generated motion expend at least a small minimum
+# amount of energy relevant to the prompt verb -- root path for locomotion,
+# yaw rotation for spin/turn, root-y range for jump/sit/stand, body-relative
+# speed for everything else. If the gate fails, the final reward is scaled
+# down so the gradient pushes back toward action-executing samples even
+# when matching and stillness happen to score well.
+# ---------------------------------------------------------------------------
+
+_RE_LOCOMOTION = re.compile(
+    r'\b(walk|run|jog|step|stride|march|hike|crawl|sprint|skip|sidestep|backward|forward)',
+    re.IGNORECASE,
+)
+_RE_ROTATION = re.compile(
+    r'\b(turn|spin|rotate|pivot|twist|swivel|whirl|circle)',
+    re.IGNORECASE,
+)
+_RE_VERTICAL = re.compile(
+    r'\b(jump|hop|leap|sit|stand|kneel|squat|crouch|stoop|duck|bend|bow)',
+    re.IGNORECASE,
+)
+_RE_GENERIC_MOTION = re.compile(
+    r'\b(kick|punch|throw|wave|stretch|reach|swing|clap|dance|shake|nod|grab|raise|lift|lower|drop|swim)',
+    re.IGNORECASE,
+)
+
+
+def _compute_motion_energy(
+    joint_pos: torch.Tensor,
+    motion_raw: torch.Tensor,
+) -> Dict[str, float]:
+    """Measure actual motion energy on four axes.
+
+    Returns dict {path_m, yaw_rad, y_range_m, rel_speed} -- the same keys
+    used by `_required_minimum_energy` so the gate can compare per-axis.
+    """
+    T = joint_pos.shape[0]
+    if T < 2:
+        return {'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0}
+
+    root_xz = joint_pos[:, 0, [0, 2]]
+    path_m = float(torch.norm(root_xz[1:] - root_xz[:-1], dim=-1).sum().item())
+
+    # motion_raw[:, 0] is root angular velocity around Y; sum -> net yaw (rad)
+    yaw_rad = float(abs(motion_raw[:, 0].sum().item()))
+
+    root_y = joint_pos[:, 0, 1]
+    y_range_m = float((root_y.max() - root_y.min()).item())
+
+    rel_pos = joint_pos[:, 1:] - joint_pos[:, 0:1]
+    rel_vel = torch.norm(rel_pos[1:] - rel_pos[:-1], dim=-1)
+    rel_speed = float(rel_vel.mean().item())
+
+    return {
+        'path_m': path_m,
+        'yaw_rad': yaw_rad,
+        'y_range_m': y_range_m,
+        'rel_speed': rel_speed,
+    }
+
+
+def _required_minimum_energy(
+    caption: str,
+    parsed: Optional['ParsedCaptionConstraints'],
+) -> Dict[str, float]:
+    """Translate caption + parsed constraints into minimum energy expected
+    on each axis. Thresholds are deliberately conservative -- they catch
+    "did nothing" without double-penalizing models that mostly got it
+    right (numerical_score already grades closeness).
+    """
+    req = {'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0}
+
+    if parsed is not None:
+        for c in parsed.numerical_constraints:
+            if c.type == 'steps':
+                # Adult step ~0.7m; require >= 0.3m * N as the bare minimum
+                # to count as "took the steps".
+                req['path_m'] = max(req['path_m'], 0.30 * float(c.value))
+            elif c.type == 'degrees':
+                # Require 40% of the requested rotation (in radians).
+                req['yaw_rad'] = max(req['yaw_rad'],
+                                     0.40 * abs(float(c.value)) * np.pi / 180.0)
+            elif c.type == 'repetitions':
+                # Jumps / cycles: require visible vertical movement.
+                req['y_range_m'] = max(req['y_range_m'], 0.06)
+
+    # Verb-fallback floors (active even with empty parsed constraints).
+    if _RE_LOCOMOTION.search(caption):
+        req['path_m'] = max(req['path_m'], 0.30)
+    if _RE_ROTATION.search(caption):
+        req['yaw_rad'] = max(req['yaw_rad'], 0.50)
+    if _RE_VERTICAL.search(caption):
+        req['y_range_m'] = max(req['y_range_m'], 0.10)
+    if _RE_GENERIC_MOTION.search(caption):
+        req['rel_speed'] = max(req['rel_speed'], 0.0015)
+
+    return req
+
+
+def motion_energy_gate(
+    actual: Dict[str, float],
+    required: Dict[str, float],
+    floor: float = 0.25,
+) -> float:
+    """Return value in [floor, 1.0] -- multiplicative factor on the reward.
+
+    For each required axis (>0), compute satisfaction ratio in [0, 1].
+    Take the MIN over axes (one missing axis is enough to fail). Lerp from
+    `floor` (full miss) to 1.0 (full satisfy) so the gradient stays alive
+    instead of cliffing to zero.
+
+    Floor 0.25 means a fully-frozen sample sees its reward weighted at 25%,
+    while a perfectly-executed sample sees 100%. The training signal in
+    between is monotonic.
+    """
+    active = [k for k, v in required.items() if v > 0]
+    if not active:
+        return 1.0
+    min_ratio = 1.0
+    for k in active:
+        ratio = actual.get(k, 0.0) / max(required[k], 1e-6)
+        ratio = min(1.0, max(0.0, ratio))
+        if ratio < min_ratio:
+            min_ratio = ratio
+    return floor + (1.0 - floor) * min_ratio
 
 
 # ---------------------------------------------------------------------------
@@ -2488,6 +2626,13 @@ class GRPORewardModel:
         has_executor = torch.zeros(batch_size, device=self.device)
         parser_source_counts: Dict[str, int] = {}
 
+        # --- Motion-energy gate (run1 collapse fix) ---
+        # Multiplier on the action-specific reward branches (physical + cap_sat)
+        # that goes to ~0.25 when the generated motion fails to expend the
+        # minimum energy implied by the caption's verb. Defaults to 1.0 (no
+        # penalty) for non-motion captions.
+        energy_gates = torch.ones(batch_size, device=self.device)
+
         for i in range(batch_size):
             length = int(motion_lengths[i].item())
             motion_norm = motions[i, :length]  # [T, 263]
@@ -2585,6 +2730,17 @@ class GRPORewardModel:
                 except Exception:
                     kinematic_scores[i] = 0.0
 
+            # -- Motion-energy gate (P0.C) --
+            # Compare the four-axis energy of the generated motion against
+            # the minimum implied by the caption verb / parsed constraints.
+            # Cheap (only joint_pos + motion_raw[:,0] + a few regex matches)
+            # so we run it for every sample regardless of motion_is_alive.
+            energy_actual = _compute_motion_energy(joint_pos, motion_raw)
+            energy_required = _required_minimum_energy(captions[i], parsed_constraints)
+            energy_gates[i] = motion_energy_gate(
+                energy_actual, energy_required, floor=0.25,
+            )
+
         # --- Combine rewards ---
         # Matching score: shifted to [0, 1] range using positive cosine similarity
         # (InfoNCE is in [-log(B), 0]; instead use raw cosine for combination)
@@ -2639,10 +2795,23 @@ class GRPORewardModel:
         length_frac = motion_lengths.float() / motion_lengths.float().clamp(min=1).max()
         length_penalty = self.length_penalty_weight * length_frac
 
+        # Energy-gate scaling (P0.C, post-run1 fix).
+        # We scale physical (only when positive -- never reduce a stillness
+        # penalty) and caption_sat by the per-sample gate. cos_sim_01 is
+        # left alone so the model keeps a baseline gradient toward "look
+        # like a human" even when energy gate fails; physical and cap_sat
+        # carry the "do the action" gradient.
+        physical_gated = torch.where(
+            physical_scores > 0,
+            physical_scores * energy_gates,
+            physical_scores,
+        )
+        caption_sat_gated = caption_sat * energy_gates
+
         rewards = (
             w_match * cos_sim_01
-            + w_phys * physical_scores
-            + w_cap * caption_sat
+            + w_phys * physical_gated
+            + w_cap * caption_sat_gated
             - length_penalty
         )
 
@@ -2672,6 +2841,9 @@ class GRPORewardModel:
             ),
             'direction_frac': has_direction.mean().item(),
             'length_penalty_mean': length_penalty.mean().item(),
+            'energy_gate_mean': energy_gates.mean().item(),
+            'energy_gate_min': energy_gates.min().item(),
+            'energy_gate_low_frac': (energy_gates < 0.5).float().mean().item(),
             'constraint_parser_mode': self.constraint_parser_mode,
             'constraint_parser_llm_frac': parser_source_counts.get('llm', 0) / max(batch_size, 1),
             'constraint_parser_hybrid_frac': parser_source_counts.get('hybrid', 0) / max(batch_size, 1),
@@ -2689,10 +2861,14 @@ class GRPORewardModel:
             return rewards, {
                 'matching_scores': cos_sim,
                 'physical_scores': physical_scores,
+                'physical_gated': physical_gated,
                 'numerical_scores': numerical_scores,
                 'kinematic_scores': kinematic_scores,
                 'executor_scores': executor_scores,
                 'direction_scores': direction_scores,
+                'caption_sat': caption_sat,
+                'caption_sat_gated': caption_sat_gated,
+                'energy_gates': energy_gates,
                 'length_penalty': length_penalty,
                 'has_numerical': has_numerical,
                 'has_kinematic': has_kinematic,

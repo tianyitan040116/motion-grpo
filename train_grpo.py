@@ -82,6 +82,7 @@ import logging
 import json
 import sys
 import argparse
+from collections import deque
 from typing import List, Tuple
 from tqdm import tqdm
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -218,6 +219,21 @@ def get_grpo_args():
     parser.add_argument('--mix-seed', type=int, default=0,
                         help='seed for prompt-mix sampling rng')
 
+    # Collapse detection (P0.C, post-run1 reward-hacking diagnosis).
+    # Track rolling stats and emit COLLAPSE-WARN once enough consecutive
+    # batches match the run1 signature (phys saturated + numerical at 0 +
+    # sft_kl drifting + token-length variance dropping + energy gate failing).
+    parser.add_argument('--collapse-window', type=int, default=50,
+                        help='rolling window (batches) over which collapse signals are averaged')
+    parser.add_argument('--collapse-warn-batches', type=int, default=30,
+                        help='emit COLLAPSE-WARN after this many consecutive collapse-firing batches')
+    parser.add_argument('--collapse-stop', action='store_true',
+                        help='actually exit training when --collapse-stop-batches consecutive batches fire collapse signals')
+    parser.add_argument('--collapse-stop-batches', type=int, default=80,
+                        help='consecutive collapse batches required to trigger sys.exit (only if --collapse-stop set)')
+    parser.add_argument('--best-rolling-window', type=int, default=50,
+                        help='use rolling-mean reward over this many batches as the "best" criterion (1 = single-batch)')
+
     # Output
     parser.add_argument('--out-dir', type=str, default='experiments_grpo')
     parser.add_argument('--exp-name', type=str, default='grpo_test')
@@ -286,6 +302,22 @@ class GRPOTrainer:
         self.ref_lora = None
         self.ref_embeddings = None
         self.ref_lm_head = None
+
+        # --- Collapse-detection state (P0.C, post-run1) ---
+        # Rolling per-batch metric deques. Each batch we append; collapse
+        # criteria check the rolling mean once the deque is full. Best
+        # tracking uses rolling_reward's mean instead of single-batch reward.
+        win = max(1, int(getattr(args, 'collapse_window', 50)))
+        best_win = max(1, int(getattr(args, 'best_rolling_window', 50)))
+        self._collapse_window = win
+        self.rolling_reward = deque(maxlen=best_win)
+        self.rolling_phys = deque(maxlen=win)
+        self.rolling_num = deque(maxlen=win)
+        self.rolling_sft_kl = deque(maxlen=win)
+        self.rolling_tok_len_std = deque(maxlen=win)
+        self.rolling_energy_gate = deque(maxlen=win)
+        self._collapse_streak = 0          # consecutive batches where >=2 signals fire
+        self._collapse_last_warn_at = 0    # batch idx of last WARN we emitted
 
     def get_lr(self):
         """Cosine learning rate schedule with warmup"""
@@ -642,15 +674,31 @@ class GRPOTrainer:
         if not flat_captions:
             return {
                 'loss': 0.0, 'reward': 0.0, 'mean_logprob': 0.0,
-                'kl': 0.0, 'ratio': 1.0, 'clip_fraction': 0.0,
+                'kl': 0.0, 'sft_kl': 0.0, 'ratio': 1.0, 'clip_fraction': 0.0,
                 'inner_steps_used': 0, 'lr': self.update_lr(),
                 'pos_sim': 0.0, 'neg_sim': 0.0,
                 'physical': 0.0, 'numerical': 0.0, 'num_frac': 0.0,
+                'kinematic': 0.0, 'kin_frac': 0.0,
+                'executor': 0.0, 'exec_frac': 0.0,
+                'energy_gate': 1.0, 'energy_gate_low_frac': 0.0,
+                'tok_len_mean': 0.0, 'tok_len_std': 0.0,
             }
 
         # Compute rewards for all valid samples
         all_rewards = self.reward_model.compute_reward(flat_captions, flat_motions)
         reward_stats = getattr(self.reward_model, '_reward_stats', {})
+
+        # Token-length diversity inside this batch's group samples. Run1 ended
+        # with 28/28/28 tokens across all sampling seeds for the same prompt
+        # -- entropy collapse in the policy head. Tracking std lets the
+        # collapse monitor catch this even before the reward components budge.
+        tok_lens = [int(t.numel()) for t in flat_motions]
+        if len(tok_lens) > 1:
+            tok_len_std = float(np.std(tok_lens))
+            tok_len_mean = float(np.mean(tok_lens))
+        else:
+            tok_len_std = 0.0
+            tok_len_mean = float(tok_lens[0]) if tok_lens else 0.0
 
         # Group rewards by caption and compute group-relative advantages
         # Build per-caption reward groups
@@ -752,9 +800,44 @@ class GRPOTrainer:
             'kin_frac': reward_stats.get('kinematic_frac', 0.0),
             'executor': reward_stats.get('executor_mean', 0.0),
             'exec_frac': reward_stats.get('executor_frac', 0.0),
+            'energy_gate': reward_stats.get('energy_gate_mean', 1.0),
+            'energy_gate_low_frac': reward_stats.get('energy_gate_low_frac', 0.0),
+            'tok_len_mean': tok_len_mean,
+            'tok_len_std': tok_len_std,
         }
 
         return metrics
+
+    def _check_collapse_signals(self) -> List[str]:
+        """Return list of currently-firing collapse signals based on rolling stats.
+
+        Each signal compares a recent-window mean against a threshold known
+        to coincide with the run1 reward-hacking collapse. >=2 signals
+        firing = treat the batch as "collapse-firing"; consecutive
+        collapse-firing batches drive the COLLAPSE-WARN/STOP emissions in
+        the train loop.
+          - phys_saturated:   rolling phys mean > 0.92 (stillness ceiling)
+          - num_collapsed:    rolling numerical mean < 0.15 (lost the numbers)
+          - sft_kl_drift:     rolling sft_kl mean > 1.5 (policy left SFT manifold)
+          - tok_len_uniform:  rolling stddev of generated token lengths < 4
+                              (group entropy collapsed)
+          - energy_gate_fail: rolling energy_gate mean < 0.5
+                              (motion doesn't satisfy caption verb)
+        """
+        fired: List[str] = []
+        win = self._collapse_window
+        if len(self.rolling_phys) >= win and float(np.mean(self.rolling_phys)) > 0.92:
+            fired.append('phys_saturated')
+        # numerical only meaningful when we have any numeric prompts in the window
+        if len(self.rolling_num) >= max(10, win // 5) and float(np.mean(self.rolling_num)) < 0.15:
+            fired.append('num_collapsed')
+        if len(self.rolling_sft_kl) >= win and float(np.mean(self.rolling_sft_kl)) > 1.5:
+            fired.append('sft_kl_drift')
+        if len(self.rolling_tok_len_std) >= win and float(np.mean(self.rolling_tok_len_std)) < 4.0:
+            fired.append('tok_len_uniform')
+        if len(self.rolling_energy_gate) >= win and float(np.mean(self.rolling_energy_gate)) < 0.5:
+            fired.append('energy_gate_fail')
+        return fired
 
     def train_epoch(self, train_loader, epoch: int, start_batch_idx: int = 0, best_reward: float = -float('inf')):
         """Train for one epoch"""
@@ -774,6 +857,8 @@ class GRPOTrainer:
             'numerical': [],
             'kinematic': [],
             'executor': [],
+            'energy_gate': [],
+            'tok_len_std': [],
         }
         last_batch_idx = start_batch_idx - 1
         processed_batches = 0
@@ -814,8 +899,52 @@ class GRPOTrainer:
                 f"LR: {metrics['lr']:.6f}, "
                 f"PosSim: {metrics['pos_sim']:.4f}, NegSim: {metrics['neg_sim']:.4f}, "
                 f"Phys: {metrics.get('physical', 0):.4f}, Num: {metrics.get('numerical', 0):.4f}, "
-                f"Kin: {metrics.get('kinematic', 0):.4f}, Exec: {metrics.get('executor', 0):.4f}"
+                f"Kin: {metrics.get('kinematic', 0):.4f}, Exec: {metrics.get('executor', 0):.4f}, "
+                f"EnergyGate: {metrics.get('energy_gate', 1.0):.3f}, "
+                f"TokLenStd: {metrics.get('tok_len_std', 0.0):.2f} "
+                f"(mean={metrics.get('tok_len_mean', 0.0):.1f})"
             )
+
+            # --- Collapse-signal tracking (P0.C, post-run1) ---
+            self.rolling_reward.append(float(metrics.get('reward', 0.0)))
+            self.rolling_phys.append(float(metrics.get('physical', 0.0)))
+            if float(metrics.get('num_frac', 0.0)) > 0:
+                self.rolling_num.append(float(metrics.get('numerical', 0.0)))
+            self.rolling_sft_kl.append(float(metrics.get('sft_kl', 0.0)))
+            self.rolling_tok_len_std.append(float(metrics.get('tok_len_std', 0.0)))
+            self.rolling_energy_gate.append(float(metrics.get('energy_gate', 1.0)))
+
+            collapse_fired = self._check_collapse_signals()
+            if len(collapse_fired) >= 2:
+                self._collapse_streak += 1
+            else:
+                self._collapse_streak = 0
+
+            warn_after = int(getattr(self.args, 'collapse_warn_batches', 30))
+            stop_after = int(getattr(self.args, 'collapse_stop_batches', 80))
+            if self._collapse_streak >= warn_after and (
+                self._collapse_streak == warn_after
+                or (self._collapse_streak - warn_after) % 20 == 0
+            ):
+                rolling_mean = (
+                    float(np.mean(self.rolling_reward))
+                    if len(self.rolling_reward) > 0 else 0.0
+                )
+                self.logger.warning(
+                    f"[COLLAPSE-WARN] {self._collapse_streak} consecutive collapse batches "
+                    f"(epoch {epoch} batch {batch_idx+1}); signals=[{', '.join(collapse_fired)}]; "
+                    f"rolling_reward={rolling_mean:.3f}. Inspect "
+                    f"motionllm_grpo_best.pth + recent samples before continuing."
+                )
+            if getattr(self.args, 'collapse_stop', False) and self._collapse_streak >= stop_after:
+                self.logger.error(
+                    f"[COLLAPSE-STOP] {self._collapse_streak} consecutive collapse batches reached. "
+                    f"Halting via sys.exit(2). Last grpo_state.pth at "
+                    f"{os.path.join(self.args.out_dir, 'grpo_state.pth')} can be resumed after reward fix."
+                )
+                state_path = os.path.join(self.args.out_dir, 'grpo_state.pth')
+                self.save_state(state_path, epoch, batch_idx + 1, best_reward=best_reward)
+                sys.exit(2)
 
             # Save checkpoint every 25 batches (configurable via
             # --checkpoint-every-batches if you want a different cadence).
@@ -824,18 +953,21 @@ class GRPOTrainer:
                 self.save_state(state_path, epoch, batch_idx + 1, best_reward=best_reward)
                 self.logger.info(f"[CHECKPOINT] Saved at Epoch {epoch} Batch {batch_idx+1}")
 
-            # Track running best by per-batch reward and save immediately.
-            # The end-of-epoch loop also rechecks, so this gives us a
-            # finer-grained "best so far" image even mid-epoch.
-            current_reward = float(metrics.get('reward', 0.0))
-            if current_reward > best_reward:
-                best_reward = current_reward
-                best_path = os.path.join(self.args.out_dir, 'motionllm_grpo_best.pth')
-                self.model.save_model(best_path)
-                self.logger.info(
-                    f"[BEST] Reward {best_reward:.4f} at Epoch {epoch} Batch {batch_idx+1}; "
-                    f"saved {best_path}"
-                )
+            # Track running best by ROLLING-MEAN reward (post-run1 fix).
+            # Single-batch best lets a one-batch spike claim "best" even
+            # after collapse; rolling mean requires the policy to actually
+            # stabilize at a higher reward level.
+            best_win = int(getattr(self.args, 'best_rolling_window', 50))
+            if len(self.rolling_reward) >= best_win:
+                rolling_mean = float(np.mean(self.rolling_reward))
+                if rolling_mean > best_reward:
+                    best_reward = rolling_mean
+                    best_path = os.path.join(self.args.out_dir, 'motionllm_grpo_best.pth')
+                    self.model.save_model(best_path)
+                    self.logger.info(
+                        f"[BEST] Rolling-mean({best_win}) reward={best_reward:.4f} "
+                        f"at Epoch {epoch} Batch {batch_idx+1}; saved {best_path}"
+                    )
 
             if self.args.max_train_batches > 0 and processed_batches >= self.args.max_train_batches:
                 self.logger.info(
