@@ -748,6 +748,7 @@ def _compute_motion_energy(
     if T < 2:
         return {
             'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0,
+            'active_frac': 0.0,
             'signed_forward_m': 0.0, 'signed_left_m': 0.0,
         }
 
@@ -761,8 +762,14 @@ def _compute_motion_energy(
     y_range_m = float((root_y.max() - root_y.min()).item())
 
     rel_pos = joint_pos[:, 1:] - joint_pos[:, 0:1]
-    rel_vel = torch.norm(rel_pos[1:] - rel_pos[:-1], dim=-1)
-    rel_speed = float(rel_vel.mean().item())
+    rel_vel_per_frame = torch.norm(rel_pos[1:] - rel_pos[:-1], dim=-1).mean(dim=-1)
+    rel_speed = float(rel_vel_per_frame.mean().item())
+    # Fraction of frames whose articulation speed exceeds the static-pose
+    # floor (~0.0008 m/frame). HumanML3D real walks sit around 0.001-0.005;
+    # a frozen pose floor is ~1e-5. This axis fires when the motion contains
+    # bursts of activity sandwiched between long static stretches -- the
+    # "walks two steps then stops" pattern caught in run3 GIFs.
+    active_frac = float((rel_vel_per_frame > 0.0008).float().mean().item())
 
     # Signed world-frame displacement from frame 0 to last frame. With
     # HumanML3D's facing-aligned normalization, +Z = initial forward,
@@ -775,6 +782,7 @@ def _compute_motion_energy(
         'yaw_rad': yaw_rad,
         'y_range_m': y_range_m,
         'rel_speed': rel_speed,
+        'active_frac': active_frac,
         'signed_forward_m': signed_forward_m,
         'signed_left_m': signed_left_m,
     }
@@ -810,6 +818,7 @@ def _required_minimum_energy(
     """
     req = {
         'path_m': 0.0, 'yaw_rad': 0.0, 'y_range_m': 0.0, 'rel_speed': 0.0,
+        'active_frac': 0.0,
         'signed_forward_m': 0.0, 'signed_left_m': 0.0,
     }
 
@@ -833,6 +842,11 @@ def _required_minimum_energy(
     # Verb-fallback floors (active even with empty parsed constraints).
     if _RE_LOCOMOTION.search(caption):
         req['path_m'] = max(req['path_m'], 0.20)
+        # Require at least 70% of frames to be actively articulating. Catches
+        # the "two steps then freeze" pattern -- mean rel_speed averages the
+        # bursts and the freeze together, but active_frac collapses on the
+        # frozen tail.
+        req['active_frac'] = max(req['active_frac'], 0.70)
     if _RE_ROTATION.search(caption):
         req['yaw_rad'] = max(req['yaw_rad'], 0.50)
     if _RE_VERTICAL.search(caption):
@@ -880,13 +894,21 @@ def motion_energy_gate(
     actual: Dict[str, float],
     required: Dict[str, float],
     floor: float = 0.25,
+    hard_gate_threshold: float = 0.5,
 ) -> float:
     """Return value in [floor, 1.0] -- multiplicative factor on the reward.
 
-    For each required axis (non-zero), compute satisfaction ratio in [0, 1].
+    Per-axis graded hard gate (post-run3 fix for "walks 3m" failure mode):
+    run3 GIFs showed the policy gaming the soft floor -- "walk 1m of the
+    required 3m" yielded gate ~0.50, enough reward to be a local optimum
+    for "barely move + plausible pose". The fix: any axis ratio below
+    `hard_gate_threshold` (0.5) snaps to 0 *before* the floor lerp, so
+    massively under-satisfied axes can no longer cash in on the floor.
+    Ratios in [0.5, 1.0] are linearly remapped to [0, 1] so the gradient
+    stays alive for samples that are close but not perfect.
+
     Take the MIN over axes (one missing axis is enough to fail). Lerp from
-    `floor` (full miss) to 1.0 (full satisfy) so the gradient stays alive
-    instead of cliffing to zero.
+    `floor` (full miss) to 1.0 (full satisfy) on the remapped score.
 
     Signed axes (e.g., signed_forward_m for "walks forward" prompts):
     `actual / required` is positive when both have the same sign (right
@@ -894,14 +916,13 @@ def motion_energy_gate(
     [0,1] handles both: same-sign-large-magnitude -> 1.0, wrong-sign or
     near-zero -> 0.0.
 
-    Floor 0.25 means a fully-frozen sample sees its reward weighted at 25%,
-    while a perfectly-executed sample sees 100%. The training signal in
-    between is monotonic.
+    Floor 0.25 means a fully-failed sample (ratio < 0.5 on any axis) sees
+    its reward weighted at 25%, while a perfectly-executed sample sees 100%.
     """
     active = [k for k, v in required.items() if v != 0]
     if not active:
         return 1.0
-    min_ratio = 1.0
+    min_score = 1.0
     for k in active:
         req = required[k]
         act = actual.get(k, 0.0)
@@ -911,9 +932,16 @@ def motion_energy_gate(
         # ratio -> clamped to 0 (full penalty).
         ratio = act / req
         ratio = min(1.0, max(0.0, ratio))
-        if ratio < min_ratio:
-            min_ratio = ratio
-    return floor + (1.0 - floor) * min_ratio
+        # Graded hard gate: below threshold the axis fails outright; above
+        # it, linearly remap [threshold, 1] -> [0, 1] so the policy still
+        # sees a gradient for samples that are close to satisfaction.
+        if ratio < hard_gate_threshold:
+            score = 0.0
+        else:
+            score = (ratio - hard_gate_threshold) / (1.0 - hard_gate_threshold)
+        if score < min_score:
+            min_score = score
+    return floor + (1.0 - floor) * min_score
 
 
 # ---------------------------------------------------------------------------
